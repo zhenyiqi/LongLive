@@ -221,31 +221,7 @@ if local_rank == 0:
 if dist.is_initialized():
     dist.barrier()
 
-# Patch the pipeline inference method to track frame timing
-original_inference = pipeline.inference
-
-def inference_with_timing(*args, **kwargs):
-    latency_tracker = LatencyTracker()
-    latency_tracker.start_generation()
-    
-    # For frame-by-frame timing, we need to modify the generation process
-    # This is a simplified approach - you may need to modify the actual pipeline
-    # to get per-frame timing in a real streaming generation scenario
-    
-    result = original_inference(*args, **kwargs)
-    
-    # Simulate frame timing for demonstration
-    # In a real implementation, you'd instrument the actual frame generation loop
-    num_frames = config.num_output_frames
-    for frame_idx in range(num_frames):
-        # Simulate variable frame generation time
-        time.sleep(0.01 + np.random.exponential(0.005))  # Simulated processing time
-        latency_tracker.record_frame_completion(frame_idx)
-    
-    return result, latency_tracker
-
-# Replace the inference method
-pipeline.inference_with_timing = inference_with_timing
+# The pipeline now has a built-in inference_with_timing method
 
 for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     idx = batch_data['idx'].item()
@@ -272,13 +248,17 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     print("Starting latency-tracked inference...")
     print(f"Generating {config.num_output_frames} frames")
     
+    # Create latency tracker for this run
+    latency_tracker = LatencyTracker()
+    
     # Use the timing-instrumented inference
-    video_result, latency_tracker = inference_with_timing(
+    video_result = pipeline.inference_with_timing(
         noise=sampled_noise,
         text_prompts=prompts,
         return_latents=True,
         low_memory=low_memory,
         profile=False,
+        latency_tracker=latency_tracker
     )
     
     video, latents = video_result
