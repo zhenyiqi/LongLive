@@ -355,7 +355,18 @@ def instrument_wan_components():
     def timed_diffusion_forward(self, *args, **kwargs):
         if hasattr(self, 'latency_tracker') and self.latency_tracker:
             timestep_info = kwargs.get('timestep', 'unknown')
-            timestep_val = timestep_info[0].item() if torch.is_tensor(timestep_info) and timestep_info.numel() > 0 else str(timestep_info)
+            # Handle timestep tensor extraction more carefully
+            try:
+                if torch.is_tensor(timestep_info) and timestep_info.numel() > 0:
+                    # Take the first timestep value, handle multi-dimensional tensors
+                    timestep_val = float(timestep_info.flatten()[0].item())
+                else:
+                    timestep_val = str(timestep_info)
+            except Exception as e:
+                # Fallback if timestep extraction fails
+                print(f"Warning: timestep extraction failed: {e}, timestep shape: {timestep_info.shape if torch.is_tensor(timestep_info) else type(timestep_info)}")
+                timestep_val = "unknown"
+            
             with self.latency_tracker.time_component('diffusion_forward', 
                                                    operation='forward',
                                                    timestep=timestep_val):

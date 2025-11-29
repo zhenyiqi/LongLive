@@ -14,8 +14,10 @@ import torch.distributed as dist
 # Import comprehensive timing components
 try:
     import sys
-    if '/Users/zhenyiqi/github/LongLive/scripts_zhenyi' not in sys.path:
-        sys.path.append('/Users/zhenyiqi/github/LongLive/scripts_zhenyi')
+    import os
+    script_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'scripts_zhenyi')
+    if script_dir not in sys.path:
+        sys.path.append(script_dir)
     from comprehensive_latency_tracker import (
         ComprehensiveLatencyTracker, 
         time_kv_operations, 
