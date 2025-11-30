@@ -194,14 +194,18 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         
         # Record switch timing for analysis
         if self.latency_tracker and COMPREHENSIVE_TIMING_AVAILABLE:
-            self.latency_tracker.time_component('prompt_switch_total', 
-                                              segment_idx=segment_idx,
-                                              frame_idx=current_start_frame,
-                                              num_recache_frames=num_recache_frames,
-                                              cache_reset_ms=cache_reset_time,
-                                              recache_setup_ms=recache_setup_time,
-                                              recache_forward_ms=recache_forward_time,
-                                              total_ms=switch_total_time).__enter__().__exit__(None, None, None)
+            # Record as a completed timing event
+            self.latency_tracker.component_timings['prompt_switch_total'].append({
+                'segment_idx': segment_idx,
+                'frame_idx': current_start_frame,
+                'num_recache_frames': num_recache_frames,
+                'cache_reset_ms': cache_reset_time,
+                'recache_setup_ms': recache_setup_time,
+                'recache_forward_ms': recache_forward_time,
+                'total_ms': switch_total_time,
+                'gpu_time_ms': switch_total_time,
+                'cpu_time_ms': switch_total_time
+            })
 
     def inference(
         self,
