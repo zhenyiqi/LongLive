@@ -9,12 +9,33 @@
 # SPDX-License-Identifier: Apache-2.0
 from typing import List, Optional
 import torch
+import time
+import os
 
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 from utils.memory import gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation
 from pipeline.causal_inference import CausalInferencePipeline
 import torch.distributed as dist
 from utils.debug_option import DEBUG
+
+# Import comprehensive timing components
+try:
+    import sys
+    script_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'scripts_zhenyi')
+    if script_dir not in sys.path:
+        sys.path.append(script_dir)
+    from comprehensive_latency_tracker import (
+        ComprehensiveLatencyTracker, 
+        time_kv_operations, 
+        time_attention_kernel,
+        time_device_sync,
+        time_quantization,
+        instrument_wan_components
+    )
+    COMPREHENSIVE_TIMING_AVAILABLE = True
+except ImportError as e:
+    print(f"Comprehensive timing not available: {e}")
+    COMPREHENSIVE_TIMING_AVAILABLE = False
 
 
 class InteractiveCausalInferencePipeline(CausalInferencePipeline):
@@ -29,70 +50,158 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
     ):
         super().__init__(args, device, generator=generator, text_encoder=text_encoder, vae=vae)
         self.global_sink = getattr(args, "global_sink", False)
+        
+        # Initialize latency tracking
+        self.latency_tracker = None
+        self.enable_timing_logs = True
+
+    def set_latency_tracker(self, tracker):
+        """Set the comprehensive latency tracker"""
+        self.latency_tracker = tracker
+        if COMPREHENSIVE_TIMING_AVAILABLE and tracker:
+            # Instrument WAN components for timing
+            instrument_wan_components()
+            self.text_encoder.latency_tracker = tracker
+            self.generator.latency_tracker = tracker  
+            self.vae.latency_tracker = tracker
+            
+    def _log_timing(self, message: str, elapsed_ms: float = None):
+        """Log timing information"""
+        if self.enable_timing_logs:
+            if elapsed_ms is not None:
+                print(f"[Interactive Timing] {message}: {elapsed_ms:.2f} ms")
+            else:
+                print(f"[Interactive] {message}")
 
     # Internal helpers
-    def _recache_after_switch(self, output, current_start_frame, new_conditional_dict):
+    def _recache_after_switch(self, output, current_start_frame, new_conditional_dict, segment_idx: int):
+        """Recache previous frames with new prompt conditioning after a prompt switch"""
+        
+        switch_start_time = time.perf_counter()
+        self._log_timing(f"Starting prompt switch to segment {segment_idx} at frame {current_start_frame}")
+        
+        cache_reset_start = time.perf_counter()
+        
         if not self.global_sink:
-            # reset kv cache
-            for block_idx in range(self.num_transformer_blocks):
-                cache = self.kv_cache1[block_idx]
-                cache["k"].zero_()
-                cache["v"].zero_()
-                # cache["global_end_index"].zero_()
-                # cache["local_end_index"].zero_()
+            # Reset KV cache with timing
+            if self.latency_tracker and COMPREHENSIVE_TIMING_AVAILABLE:
+                with self.latency_tracker.time_component('prompt_switch_kv_reset', 
+                                                       segment_idx=segment_idx,
+                                                       frame_idx=current_start_frame):
+                    for block_idx in range(self.num_transformer_blocks):
+                        cache = self.kv_cache1[block_idx]
+                        cache["k"].zero_()
+                        cache["v"].zero_()
+            else:
+                for block_idx in range(self.num_transformer_blocks):
+                    cache = self.kv_cache1[block_idx]
+                    cache["k"].zero_()
+                    cache["v"].zero_()
             
-        # reset cross-attention cache
-        for blk in self.crossattn_cache:
-            blk["k"].zero_()
-            blk["v"].zero_()
-            blk["is_init"] = False
+        # Reset cross-attention cache
+        with time_kv_operations(self.latency_tracker, "prompt_switch_crossattn_reset", 
+                              segment_idx=segment_idx, frame_idx=current_start_frame):
+            for blk in self.crossattn_cache:
+                blk["k"].zero_()
+                blk["v"].zero_()
+                blk["is_init"] = False
+        
+        cache_reset_time = (time.perf_counter() - cache_reset_start) * 1000
+        self._log_timing(f"Cache reset completed", cache_reset_time)
 
-        # recache
+        # Early exit if no frames to recache
         if current_start_frame == 0:
+            switch_total_time = (time.perf_counter() - switch_start_time) * 1000
+            self._log_timing(f"Prompt switch completed (no recaching needed)", switch_total_time)
             return
+        
+        recache_setup_start = time.perf_counter()
         
         num_recache_frames = current_start_frame if self.local_attn_size == -1 else min(self.local_attn_size, current_start_frame)
         recache_start_frame = current_start_frame - num_recache_frames
         
         frames_to_recache = output[:, recache_start_frame:current_start_frame]
-        # move to gpu
+        
+        # Move to GPU if needed
         if frames_to_recache.device.type == 'cpu':
             target_device = next(self.generator.parameters()).device
             frames_to_recache = frames_to_recache.to(target_device)
-        batch_size = frames_to_recache.shape[0]
-        print(f"num_recache_frames: {num_recache_frames}, recache_start_frame: {recache_start_frame}, current_start_frame: {current_start_frame}")
         
-        # prepare blockwise causal mask
+        batch_size = frames_to_recache.shape[0]
+        self._log_timing(f"Recaching {num_recache_frames} frames (from {recache_start_frame} to {current_start_frame})")
+        
+        # Prepare blockwise causal mask
         device = frames_to_recache.device
-        block_mask = self.generator.model._prepare_blockwise_causal_attn_mask(
-            device=device,
-            num_frames=num_recache_frames,
-            frame_seqlen=self.frame_seq_length,
-            num_frame_per_block=self.num_frame_per_block,
-            local_attn_size=self.local_attn_size
-        )
+        
+        with time_attention_kernel(self.latency_tracker, operation="prompt_switch_mask_prep",
+                                 segment_idx=segment_idx, num_frames=num_recache_frames):
+            block_mask = self.generator.model._prepare_blockwise_causal_attn_mask(
+                device=device,
+                num_frames=num_recache_frames,
+                frame_seqlen=self.frame_seq_length,
+                num_frame_per_block=self.num_frame_per_block,
+                local_attn_size=self.local_attn_size
+            )
         
         context_timestep = torch.ones([batch_size, num_recache_frames], 
                                     device=device, dtype=torch.int64) * self.args.context_noise
         
         self.generator.model.block_mask = block_mask
         
-        # recache
-        with torch.no_grad():
-            self.generator(
-                noisy_image_or_video=frames_to_recache,
-                conditional_dict=new_conditional_dict,
-                timestep=context_timestep,
-                kv_cache=self.kv_cache1,
-                crossattn_cache=self.crossattn_cache,
-                current_start=recache_start_frame * self.frame_seq_length,
-            )
+        recache_setup_time = (time.perf_counter() - recache_setup_start) * 1000
+        self._log_timing(f"Recache setup completed", recache_setup_time)
         
-        # reset cross-attention cache
-        for blk in self.crossattn_cache:
-            blk["k"].zero_()
-            blk["v"].zero_()
-            blk["is_init"] = False
+        # Perform recaching with timing
+        recache_forward_start = time.perf_counter()
+        
+        with torch.no_grad():
+            if self.latency_tracker and COMPREHENSIVE_TIMING_AVAILABLE:
+                with self.latency_tracker.time_component('prompt_switch_recache', 
+                                                       segment_idx=segment_idx,
+                                                       frame_idx=current_start_frame,
+                                                       num_frames=num_recache_frames):
+                    self.generator(
+                        noisy_image_or_video=frames_to_recache,
+                        conditional_dict=new_conditional_dict,
+                        timestep=context_timestep,
+                        kv_cache=self.kv_cache1,
+                        crossattn_cache=self.crossattn_cache,
+                        current_start=recache_start_frame * self.frame_seq_length,
+                    )
+            else:
+                self.generator(
+                    noisy_image_or_video=frames_to_recache,
+                    conditional_dict=new_conditional_dict,
+                    timestep=context_timestep,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=recache_start_frame * self.frame_seq_length,
+                )
+        
+        recache_forward_time = (time.perf_counter() - recache_forward_start) * 1000
+        self._log_timing(f"Recache forward pass completed", recache_forward_time)
+        
+        # Reset cross-attention cache again after recaching
+        with time_kv_operations(self.latency_tracker, "prompt_switch_final_reset", 
+                              segment_idx=segment_idx):
+            for blk in self.crossattn_cache:
+                blk["k"].zero_()
+                blk["v"].zero_()
+                blk["is_init"] = False
+        
+        switch_total_time = (time.perf_counter() - switch_start_time) * 1000
+        self._log_timing(f"Prompt switch to segment {segment_idx} completed", switch_total_time)
+        
+        # Record switch timing for analysis
+        if self.latency_tracker and COMPREHENSIVE_TIMING_AVAILABLE:
+            self.latency_tracker.time_component('prompt_switch_total', 
+                                              segment_idx=segment_idx,
+                                              frame_idx=current_start_frame,
+                                              num_recache_frames=num_recache_frames,
+                                              cache_reset_ms=cache_reset_time,
+                                              recache_setup_ms=recache_setup_time,
+                                              recache_forward_ms=recache_forward_time,
+                                              total_ms=switch_total_time).__enter__().__exit__(None, None, None)
 
     def inference(
         self,
@@ -103,7 +212,27 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         return_latents: bool = False,
         low_memory: bool = False,
     ):
-        """Generate a video and switch prompts at specified frame indices.
+        """Generate a video and switch prompts at specified frame indices."""
+        return self.inference_with_timing(
+            noise=noise,
+            text_prompts_list=text_prompts_list,
+            switch_frame_indices=switch_frame_indices,
+            return_latents=return_latents,
+            low_memory=low_memory,
+            latency_tracker=self.latency_tracker
+        )
+        
+    def inference_with_timing(
+        self,
+        noise: torch.Tensor,
+        *,
+        text_prompts_list: List[List[str]],
+        switch_frame_indices: List[int],
+        return_latents: bool = False,
+        low_memory: bool = False,
+        latency_tracker=None
+    ):
+        """Generate a video and switch prompts at specified frame indices with comprehensive timing.
 
         Args:
             noise: Noise tensor, shape = (B, T_out, C, H, W).
@@ -112,7 +241,18 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                 we start using the prompts for segment i+1.
             return_latents: Whether to also return the latent tensor.
             low_memory: Enable low-memory mode.
+            latency_tracker: ComprehensiveLatencyTracker for detailed timing analysis.
         """
+        # Set up timing tracking
+        if latency_tracker:
+            self.set_latency_tracker(latency_tracker)
+            latency_tracker.start_generation()
+        
+        generation_start_time = time.perf_counter()
+        self._log_timing(f"Starting interactive inference with {len(text_prompts_list)} segments")
+        self._log_timing(f"Switch points: {switch_frame_indices}")
+        
+        # Validate inputs
         batch_size, num_output_frames, num_channels, height, width = noise.shape
         assert len(text_prompts_list) >= 1, "text_prompts_list must not be empty"
         assert len(switch_frame_indices) == len(text_prompts_list) - 1, (
@@ -122,9 +262,23 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         num_blocks = num_output_frames // self.num_frame_per_block
 
         
-        # encode all prompts
+        # Encode all prompts with timing
+        prompt_encoding_start = time.perf_counter()
+        self._log_timing(f"Encoding {len(text_prompts_list)} prompt segments...")
         print(text_prompts_list)
-        cond_list = [self.text_encoder(text_prompts=p) for p in text_prompts_list]
+        
+        if latency_tracker and COMPREHENSIVE_TIMING_AVAILABLE:
+            cond_list = []
+            for i, prompts in enumerate(text_prompts_list):
+                with latency_tracker.time_component('interactive_text_encoding', 
+                                                   segment_idx=i, 
+                                                   num_prompts=len(prompts)):
+                    cond_list.append(self.text_encoder(text_prompts=prompts))
+        else:
+            cond_list = [self.text_encoder(text_prompts=p) for p in text_prompts_list]
+            
+        prompt_encoding_time = (time.perf_counter() - prompt_encoding_start) * 1000
+        self._log_timing(f"All prompts encoded", prompt_encoding_time)
 
         if low_memory:
             gpu_memory_preservation = get_cuda_free_memory_gb(gpu) + 5
@@ -184,10 +338,17 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             print("[MultipleSwitch] all_num_frames", all_num_frames)
             print("[MultipleSwitch] switch_frame_indices", switch_frame_indices)
 
+        # Temporal denoising loop with comprehensive timing
+        block_idx = 0
+        frame_idx = 0
+        
         for current_num_frames in all_num_frames:
+            block_start_time = time.perf_counter()
+            
+            # Check for prompt switching
             if next_switch_pos is not None and current_start_frame >= next_switch_pos:
                 segment_idx += 1
-                self._recache_after_switch(output, current_start_frame, cond_list[segment_idx])
+                self._recache_after_switch(output, current_start_frame, cond_list[segment_idx], segment_idx)
                 if DEBUG:
                     print(
                         f"[MultipleSwitch] Switch to segment {segment_idx} at frame {current_start_frame}"
@@ -197,71 +358,171 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                     if segment_idx < len(switch_frame_indices)
                     else None
                 )
-                print(f"segment_idx: {segment_idx}")
-                print(f"text_prompts_list[segment_idx]: {text_prompts_list[segment_idx]}")
+                self._log_timing(f"Now using segment {segment_idx}: {text_prompts_list[segment_idx]}")
+                
             cond_in_use = cond_list[segment_idx]
 
-            noisy_input = noise[
-                :, current_start_frame : current_start_frame + current_num_frames
-            ]
+            # Start block timing
+            if latency_tracker:
+                latency_tracker.start_block(block_idx)
 
-            # ---------------- Spatial denoising loop ----------------
+            with time_device_sync(latency_tracker, "interactive_block_input_prep"):
+                noisy_input = noise[:, current_start_frame : current_start_frame + current_num_frames]
+
+            # Spatial denoising loop with timing
             for index, current_timestep in enumerate(self.denoising_step_list):
-                timestep = (
-                    torch.ones([batch_size, current_num_frames],
-                    device=noise.device,
-                    dtype=torch.int64)
-                    * current_timestep
-                )
+                timestep_val = float(current_timestep)
+                
+                with time_device_sync(latency_tracker, "interactive_timestep_prep"):
+                    timestep = (
+                        torch.ones([batch_size, current_num_frames],
+                        device=noise.device,
+                        dtype=torch.int64)
+                        * current_timestep
+                    )
 
                 if index < len(self.denoising_step_list) - 1:
-                    _, denoised_pred = self.generator(
-                        noisy_image_or_video=noisy_input,
-                        conditional_dict=cond_in_use,
-                        timestep=timestep,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length,
-                    )
-                    next_timestep = self.denoising_step_list[index + 1]
-                    noisy_input = self.scheduler.add_noise(
-                        denoised_pred.flatten(0, 1),
-                        torch.randn_like(denoised_pred.flatten(0, 1)),
-                        next_timestep
-                        * torch.ones(
-                            [batch_size * current_num_frames], device=noise.device, dtype=torch.long
-                        ),
-                    ).unflatten(0, denoised_pred.shape[:2])
+                    # Intermediate denoising step
+                    if latency_tracker and COMPREHENSIVE_TIMING_AVAILABLE:
+                        with latency_tracker.time_component('interactive_denoising_step', 
+                                                          timestep=timestep_val,
+                                                          step_index=index, 
+                                                          block_idx=block_idx,
+                                                          segment_idx=segment_idx,
+                                                          is_final_step=False):
+                            _, denoised_pred = self.generator(
+                                noisy_image_or_video=noisy_input,
+                                conditional_dict=cond_in_use,
+                                timestep=timestep,
+                                kv_cache=self.kv_cache1,
+                                crossattn_cache=self.crossattn_cache,
+                                current_start=current_start_frame * self.frame_seq_length,
+                            )
+                    else:
+                        _, denoised_pred = self.generator(
+                            noisy_image_or_video=noisy_input,
+                            conditional_dict=cond_in_use,
+                            timestep=timestep,
+                            kv_cache=self.kv_cache1,
+                            crossattn_cache=self.crossattn_cache,
+                            current_start=current_start_frame * self.frame_seq_length,
+                        )
+                        
+                    with time_device_sync(latency_tracker, "interactive_noise_scheduling"):
+                        next_timestep = self.denoising_step_list[index + 1]
+                        noisy_input = self.scheduler.add_noise(
+                            denoised_pred.flatten(0, 1),
+                            torch.randn_like(denoised_pred.flatten(0, 1)),
+                            next_timestep
+                            * torch.ones(
+                                [batch_size * current_num_frames], device=noise.device, dtype=torch.long
+                            ),
+                        ).unflatten(0, denoised_pred.shape[:2])
                 else:
-                    _, denoised_pred = self.generator(
-                        noisy_image_or_video=noisy_input,
-                        conditional_dict=cond_in_use,
-                        timestep=timestep,
-                        kv_cache=self.kv_cache1,
-                        crossattn_cache=self.crossattn_cache,
-                        current_start=current_start_frame * self.frame_seq_length,
-                    )
+                    # Final denoising step
+                    if latency_tracker and COMPREHENSIVE_TIMING_AVAILABLE:
+                        with latency_tracker.time_component('interactive_denoising_step_final', 
+                                                          timestep=timestep_val,
+                                                          step_index=index,
+                                                          block_idx=block_idx,
+                                                          segment_idx=segment_idx,
+                                                          is_final_step=True):
+                            _, denoised_pred = self.generator(
+                                noisy_image_or_video=noisy_input,
+                                conditional_dict=cond_in_use,
+                                timestep=timestep,
+                                kv_cache=self.kv_cache1,
+                                crossattn_cache=self.crossattn_cache,
+                                current_start=current_start_frame * self.frame_seq_length,
+                            )
+                    else:
+                        _, denoised_pred = self.generator(
+                            noisy_image_or_video=noisy_input,
+                            conditional_dict=cond_in_use,
+                            timestep=timestep,
+                            kv_cache=self.kv_cache1,
+                            crossattn_cache=self.crossattn_cache,
+                            current_start=current_start_frame * self.frame_seq_length,
+                        )
 
             # Record output
-            output[:, current_start_frame : current_start_frame + current_num_frames] = denoised_pred.to(output.device)
+            with time_device_sync(latency_tracker, "interactive_output_recording"):
+                output[:, current_start_frame : current_start_frame + current_num_frames] = denoised_pred.to(output.device)
 
-            # rerun with clean context to update cache
-            context_timestep = torch.ones_like(timestep) * self.args.context_noise
-            self.generator(
-                noisy_image_or_video=denoised_pred,
-                conditional_dict=cond_in_use,
-                timestep=context_timestep,
-                kv_cache=self.kv_cache1,
-                crossattn_cache=self.crossattn_cache,
-                current_start=current_start_frame * self.frame_seq_length,
-            )
+            # Record frame completion timing
+            if latency_tracker:
+                for frame_offset in range(current_num_frames):
+                    latency_tracker.record_frame_completion(frame_idx + frame_offset)
 
-            # Update frame pointer
+            # KV cache update with clean context
+            with time_device_sync(latency_tracker, "interactive_context_prep"):
+                context_timestep = torch.ones_like(timestep) * self.args.context_noise
+                
+            with time_kv_operations(latency_tracker, "interactive_kv_cache_update", 
+                                  block_idx=block_idx, 
+                                  segment_idx=segment_idx,
+                                  context_noise=self.args.context_noise):
+                self.generator(
+                    noisy_image_or_video=denoised_pred,
+                    conditional_dict=cond_in_use,
+                    timestep=context_timestep,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=current_start_frame * self.frame_seq_length,
+                )
+
+            # End block timing
+            if latency_tracker:
+                latency_tracker.end_block()
+                
+            block_time = (time.perf_counter() - block_start_time) * 1000
+            self._log_timing(f"Block {block_idx} (frames {current_start_frame}-{current_start_frame+current_num_frames-1}, segment {segment_idx}) completed", block_time)
+
+            # Update pointers
             current_start_frame += current_num_frames
+            frame_idx += current_num_frames
+            block_idx += 1
 
-        # Standard decoding
-        video = self.vae.decode_to_pixel(output.to(noise.device), use_cache=False)
-        video = (video * 0.5 + 0.5).clamp(0, 1)
+        # VAE decoding with timing
+        vae_decode_start = time.perf_counter()
+        self._log_timing("Starting VAE decode...")
+        
+        with time_device_sync(latency_tracker, "interactive_vae_input_prep"):
+            output_for_vae = output.to(noise.device)
+            
+        if latency_tracker and COMPREHENSIVE_TIMING_AVAILABLE:
+            with latency_tracker.time_component('interactive_vae_decode', 
+                                              num_frames=num_output_frames,
+                                              input_shape=list(output.shape)):
+                video = self.vae.decode_to_pixel(output_for_vae, use_cache=False)
+        else:
+            video = self.vae.decode_to_pixel(output_for_vae, use_cache=False)
+            
+        with time_device_sync(latency_tracker, "interactive_vae_postprocess"):
+            video = (video * 0.5 + 0.5).clamp(0, 1)
+        
+        vae_decode_time = (time.perf_counter() - vae_decode_start) * 1000
+        self._log_timing(f"VAE decode completed", vae_decode_time)
+        
+        # Complete timing and log summary
+        generation_total_time = (time.perf_counter() - generation_start_time) * 1000
+        self._log_timing(f"Interactive inference completed", generation_total_time)
+        
+        if latency_tracker:
+            latency_tracker.end_generation()
+            
+            # Log timing summary
+            print("\n" + "="*60)
+            print("INTERACTIVE INFERENCE TIMING SUMMARY")
+            print("="*60)
+            print(f"Total generation time: {generation_total_time:.2f} ms")
+            print(f"Prompt encoding time: {prompt_encoding_time:.2f} ms")
+            print(f"VAE decode time: {vae_decode_time:.2f} ms")
+            print(f"Number of segments: {len(text_prompts_list)}")
+            print(f"Number of blocks: {num_blocks}")
+            print(f"Frames per block: {self.num_frame_per_block}")
+            print(f"Switch frame indices: {switch_frame_indices}")
+            print("="*60)
 
         if return_latents:
             return video, output
