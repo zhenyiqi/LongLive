@@ -503,12 +503,12 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         if not hasattr(self, '_vae_compiled'):
             self._log_timing("Compiling VAE decoder for H100...")
             try:
-                # Use torch.compile with aggressive optimization for H100
+                # Use torch.compile with H100 optimization, less aggressive to avoid sympy issues
                 self.vae._compiled_decode = torch.compile(
                     self.vae.decode_to_pixel,
-                    mode="max-autotune",  # Most aggressive optimization for H100
-                    dynamic=True,         # Handle variable input sizes
-                    fullgraph=False       # Allow graph breaks if needed
+                    mode="reduce-overhead",  # Less aggressive than max-autotune, more stable
+                    dynamic=False,           # Fixed input sizes for better optimization
+                    fullgraph=False          # Allow graph breaks if needed
                 )
                 self._vae_compiled = True
                 self._log_timing("VAE decoder compilation successful")
