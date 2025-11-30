@@ -497,15 +497,27 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         with time_device_sync(latency_tracker, "interactive_vae_input_prep"):
             output_for_vae = output.to(noise.device)
             
-        # Use mixed precision for VAE decode optimization
-        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True):
+        # Chunked VAE decode for better memory efficiency and potential speed improvement
+        chunk_size = 16  # Process 16 frames at a time
+        video_chunks = []
+        
+        for chunk_start in range(0, num_output_frames, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, num_output_frames)
+            chunk_latents = output_for_vae[:, chunk_start:chunk_end]
+            
             if latency_tracker and COMPREHENSIVE_TIMING_AVAILABLE:
-                with latency_tracker.time_component('interactive_vae_decode', 
-                                                  num_frames=num_output_frames,
-                                                  input_shape=list(output.shape)):
-                    video = self.vae.decode_to_pixel(output_for_vae, use_cache=False)
+                with latency_tracker.time_component('interactive_vae_decode_chunk', 
+                                                  chunk_idx=chunk_start//chunk_size,
+                                                  chunk_frames=chunk_end-chunk_start,
+                                                  total_chunks=(num_output_frames + chunk_size - 1) // chunk_size):
+                    chunk_video = self.vae.decode_to_pixel(chunk_latents, use_cache=False)
             else:
-                video = self.vae.decode_to_pixel(output_for_vae, use_cache=False)
+                chunk_video = self.vae.decode_to_pixel(chunk_latents, use_cache=False)
+                
+            video_chunks.append(chunk_video)
+            
+        # Concatenate all chunks
+        video = torch.cat(video_chunks, dim=1)
             
         with time_device_sync(latency_tracker, "interactive_vae_postprocess"):
             video = (video * 0.5 + 0.5).clamp(0, 1)
