@@ -498,7 +498,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             output_for_vae = output.to(noise.device)
             
         # Chunked VAE decode for better memory efficiency and potential speed improvement
-        chunk_size = 16  # Process 16 frames at a time
+        chunk_size = 60  # Process 60 frames at a time (quarter of total)
         video_chunks = []
         
         for chunk_start in range(0, num_output_frames, chunk_size):
