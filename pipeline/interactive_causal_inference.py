@@ -252,6 +252,9 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             self.set_latency_tracker(latency_tracker)
             latency_tracker.start_generation()
         
+        # Store switch indices for frame saving
+        self.set_current_switch_indices(switch_frame_indices)
+        
         generation_start_time = time.perf_counter()
         self._log_timing(f"Starting interactive inference with {len(text_prompts_list)} segments")
         self._log_timing(f"Switch points: {switch_frame_indices}")
@@ -494,13 +497,15 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         with time_device_sync(latency_tracker, "interactive_vae_input_prep"):
             output_for_vae = output.to(noise.device)
             
-        if latency_tracker and COMPREHENSIVE_TIMING_AVAILABLE:
-            with latency_tracker.time_component('interactive_vae_decode', 
-                                              num_frames=num_output_frames,
-                                              input_shape=list(output.shape)):
+        # Use mixed precision for VAE decode optimization
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=True):
+            if latency_tracker and COMPREHENSIVE_TIMING_AVAILABLE:
+                with latency_tracker.time_component('interactive_vae_decode', 
+                                                  num_frames=num_output_frames,
+                                                  input_shape=list(output.shape)):
+                    video = self.vae.decode_to_pixel(output_for_vae, use_cache=False)
+            else:
                 video = self.vae.decode_to_pixel(output_for_vae, use_cache=False)
-        else:
-            video = self.vae.decode_to_pixel(output_for_vae, use_cache=False)
             
         with time_device_sync(latency_tracker, "interactive_vae_postprocess"):
             video = (video * 0.5 + 0.5).clamp(0, 1)
@@ -528,6 +533,66 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             print(f"Switch frame indices: {switch_frame_indices}")
             print("="*60)
 
+        # Save sample frames for inspection
+        self._save_sample_frames(video, generation_start_time)
+        
         if return_latents:
             return video, output
-        return video 
+        return video
+    
+    def _save_sample_frames(self, video: torch.Tensor, generation_start_time: float):
+        """Save a few sample frames with frame numbers for inspection"""
+        try:
+            import os
+            from torchvision.utils import save_image
+            
+            # Create frames directory
+            frames_dir = "/tmp/interactive_sample_frames"
+            os.makedirs(frames_dir, exist_ok=True)
+            
+            batch_size, num_frames = video.shape[0], video.shape[1]
+            timestamp = int(generation_start_time)
+            
+            # Save frames at different points: start, middle, switches, end
+            frames_to_save = [
+                0,  # First frame
+                num_frames // 4,  # 25% through
+                num_frames // 2,  # Middle frame  
+                3 * num_frames // 4,  # 75% through
+                num_frames - 1  # Last frame
+            ]
+            
+            # Add switch frames if we have switch indices
+            if hasattr(self, '_current_switch_indices'):
+                for switch_idx in self._current_switch_indices:
+                    if 0 <= switch_idx < num_frames:
+                        # Save the switch frame and 4 frames after
+                        frames_to_save.append(switch_idx)  # Switch frame
+                        for offset in range(1, 5):  # 4 frames after switch
+                            next_frame = switch_idx + offset
+                            if next_frame < num_frames:
+                                frames_to_save.append(next_frame)
+            
+            # Remove duplicates and sort
+            frames_to_save = sorted(list(set(frames_to_save)))
+            
+            for batch_idx in range(min(batch_size, 1)):  # Save only first batch item
+                for frame_idx in frames_to_save:
+                    if frame_idx < num_frames:
+                        # Extract frame: [C, H, W]
+                        frame = video[batch_idx, frame_idx]  # Shape: [3, H, W]
+                        
+                        # Save frame
+                        filename = f"frame_batch{batch_idx}_frame{frame_idx:03d}_t{timestamp}.png"
+                        filepath = os.path.join(frames_dir, filename)
+                        save_image(frame, filepath, normalize=True, value_range=(0, 1))
+            
+            self._log_timing(f"Sample frames saved to {frames_dir} (frames: {frames_to_save})")
+            
+        except Exception as e:
+            # Don't fail the entire inference if frame saving fails
+            print(f"Warning: Could not save sample frames: {e}")
+            
+    def set_current_switch_indices(self, switch_indices: List[int]):
+        """Store switch indices for frame saving reference"""
+        self._current_switch_indices = switch_indices 
