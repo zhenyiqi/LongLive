@@ -497,52 +497,46 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         with time_device_sync(latency_tracker, "interactive_vae_input_prep"):
             output_for_vae = output.to(noise.device)
             
-        # H100 FP8 optimization for VAE decode
-        try:
-            from transformer_engine import pytorch as te
-            # Configure FP8 recipe for H100 optimal settings
-            fp8_recipe = te.recipe.DelayedScaling(
-                margin=0,
-                interval=1,
-                fp8_format=te.recipe.Format.E4M3,  # E4M3 for activations
-                amax_history_len=1,
-                amax_compute_algo="most_recent"
-            )
-            
-            # Pre-allocate FP8 state for efficiency
-            with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
-                self._log_timing("Using Transformer Engine FP8 on H100")
-                if latency_tracker and COMPREHENSIVE_TIMING_AVAILABLE:
-                    with latency_tracker.time_component('interactive_vae_decode_fp8_h100', 
-                                                      num_frames=num_output_frames,
-                                                      input_shape=list(output.shape),
-                                                      fp8_format="E4M3"):
-                        video = self.vae.decode_to_pixel(output_for_vae, use_cache=False)
-                else:
-                    video = self.vae.decode_to_pixel(output_for_vae, use_cache=False)
-                    
-        except ImportError:
-            # Fallback to PyTorch native FP8
-            self._log_timing("Transformer Engine not available, trying PyTorch FP8")
+        # H100 optimization using torch.compile (more reliable than FP8)
+        
+        # Compile the VAE decoder for H100 optimization on first use
+        if not hasattr(self, '_vae_compiled'):
+            self._log_timing("Compiling VAE decoder for H100...")
             try:
-                with torch.autocast(device_type='cuda', dtype=torch.float8_e4m3fn, enabled=True):
-                    if latency_tracker and COMPREHENSIVE_TIMING_AVAILABLE:
-                        with latency_tracker.time_component('interactive_vae_decode_torch_fp8', 
-                                                          num_frames=num_output_frames,
-                                                          input_shape=list(output.shape)):
-                            video = self.vae.decode_to_pixel(output_for_vae, use_cache=False)
-                    else:
-                        video = self.vae.decode_to_pixel(output_for_vae, use_cache=False)
+                # Use torch.compile with aggressive optimization for H100
+                self.vae._compiled_decode = torch.compile(
+                    self.vae.decode_to_pixel,
+                    mode="max-autotune",  # Most aggressive optimization for H100
+                    dynamic=True,         # Handle variable input sizes
+                    fullgraph=False       # Allow graph breaks if needed
+                )
+                self._vae_compiled = True
+                self._log_timing("VAE decoder compilation successful")
             except Exception as e:
-                # Final fallback
-                self._log_timing(f"FP8 failed ({e}), using default precision")
-                if latency_tracker and COMPREHENSIVE_TIMING_AVAILABLE:
-                    with latency_tracker.time_component('interactive_vae_decode_fallback', 
-                                                      num_frames=num_output_frames,
-                                                      input_shape=list(output.shape)):
-                        video = self.vae.decode_to_pixel(output_for_vae, use_cache=False)
-                else:
+                self._log_timing(f"VAE compilation failed: {e}, using original decoder")
+                self.vae._compiled_decode = self.vae.decode_to_pixel
+                self._vae_compiled = False
+        
+        # Use compiled decoder
+        try:
+            if latency_tracker and COMPREHENSIVE_TIMING_AVAILABLE:
+                with latency_tracker.time_component('interactive_vae_decode_compiled', 
+                                                  num_frames=num_output_frames,
+                                                  input_shape=list(output.shape),
+                                                  compiled=self._vae_compiled):
+                    video = self.vae._compiled_decode(output_for_vae, use_cache=False)
+            else:
+                video = self.vae._compiled_decode(output_for_vae, use_cache=False)
+        except Exception as e:
+            # Fallback to original decoder if compiled version fails
+            self._log_timing(f"Compiled decoder failed: {e}, using original")
+            if latency_tracker and COMPREHENSIVE_TIMING_AVAILABLE:
+                with latency_tracker.time_component('interactive_vae_decode_fallback', 
+                                                  num_frames=num_output_frames,
+                                                  input_shape=list(output.shape)):
                     video = self.vae.decode_to_pixel(output_for_vae, use_cache=False)
+            else:
+                video = self.vae.decode_to_pixel(output_for_vae, use_cache=False)
             
         with time_device_sync(latency_tracker, "interactive_vae_postprocess"):
             video = (video * 0.5 + 0.5).clamp(0, 1)
