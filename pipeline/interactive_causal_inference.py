@@ -174,24 +174,10 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         self._generator_compiled = False  
         self.generator._compiled_forward = self.generator.__call__
         
-        # Compile VAE decoder - now bypasses internal caching that caused string comparison issues
-        compilation_start = time.perf_counter()
-        self._log_timing("Compiling VAE decoder (bypassing internal caching)...")
-        try:
-            self.vae._compiled_decode = torch.compile(
-                self.vae.decode_to_pixel,
-                mode="reduce-overhead", 
-                dynamic=False,  # Static shapes with batch_size=1
-                fullgraph=True   # Should work now without string comparisons
-            )
-            self._vae_compiled = True
-            compilation_time = (time.perf_counter() - compilation_start) * 1000
-            self._log_timing(f"VAE decoder compilation successful (cache-free)", compilation_time)
-        except Exception as e:
-            compilation_time = (time.perf_counter() - compilation_start) * 1000
-            self._log_timing(f"VAE compilation failed: {e}, using original decoder", compilation_time)
-            self.vae._compiled_decode = self.vae.decode_to_pixel
-            self._vae_compiled = False
+        # Skip VAE compilation - focus on keeping text encoder working
+        self._log_timing("Skipping VAE compilation (keeping original working setup)")
+        self.vae._compiled_decode = self.vae.decode_to_pixel
+        self._vae_compiled = False
             
     def _log_timing(self, message: str, elapsed_ms: float = None):
         """Log timing information"""

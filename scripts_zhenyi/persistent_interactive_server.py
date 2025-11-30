@@ -36,11 +36,6 @@ class PersistentInteractivePipeline:
         print("INITIALIZING PERSISTENT INTERACTIVE PIPELINE")
         print("="*60)
         
-        # Configure torch._dynamo to handle recompilation gracefully
-        import torch._dynamo
-        torch._dynamo.config.recompile_limit = 32  # Increase from default 8 to handle tensor variations
-        print(f"Set torch._dynamo.config.recompile_limit = {torch._dynamo.config.recompile_limit}")
-        
         # Load config
         self.config = OmegaConf.load(config_path)
         

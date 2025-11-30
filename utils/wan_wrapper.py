@@ -69,9 +69,8 @@ class WanVAEWrapper(torch.nn.Module):
             3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160
         ]
         
-        # Register as buffers so they automatically move with model and work with CUDA Graphs
-        self.register_buffer('mean', torch.tensor(mean, dtype=torch.float32))
-        self.register_buffer('std', torch.tensor(std, dtype=torch.float32))
+        self.mean = torch.tensor(mean, dtype=torch.float32)
+        self.std = torch.tensor(std, dtype=torch.float32)
 
         # init model
         self.model = _video_vae(
@@ -97,44 +96,25 @@ class WanVAEWrapper(torch.nn.Module):
         return output
 
     def decode_to_pixel(self, latent: torch.Tensor, use_cache: bool = False) -> torch.Tensor:
-        # Enforce batch size = 1 for CUDA Graph compatibility and remove Python loop
-        assert latent.shape[0] == 1, "Batch size must be 1 for CUDA Graph compatibility"
-        
         zs = latent.permute(0, 2, 1, 3, 4)
-        dtype = latent.dtype
-        
-        # Use registered buffers - no device transfers needed, CUDA Graph friendly
-        scale = [self.mean.to(dtype=dtype), 1.0 / self.std.to(dtype=dtype)]
+        if use_cache:
+            assert latent.shape[0] == 1, "Batch size must be 1 when using cache"
 
-        # Process single batch element directly - no Python loop
-        # Since batch_size=1, zs[0] is the single element
-        z = zs[0].unsqueeze(0)  # [1, c, t, h, w]
-        
-        # Apply scale transformation (same as model.decode)
-        if isinstance(scale[0], torch.Tensor):
-            z = z / scale[1].view(1, self.model.z_dim, 1, 1, 1) + scale[0].view(1, self.model.z_dim, 1, 1, 1)
+        device, dtype = latent.device, latent.dtype
+        scale = [self.mean.to(device=device, dtype=dtype),
+                 1.0 / self.std.to(device=device, dtype=dtype)]
+
+        if use_cache:
+            decode_function = self.model.cached_decode
         else:
-            z = z / scale[1] + scale[0]
-            
-        # Apply conv2 (same as model.decode)
-        x = self.model.conv2(z)
-        
-        # Decode each frame WITHOUT internal caching to avoid string comparisons
-        iter_ = x.shape[2]
-        outputs = []
-        for i in range(iter_):
-            # Call decoder with feat_cache=None to bypass string comparison logic
-            frame_out = self.model.decoder(
-                x[:, :, i:i + 1, :, :],
-                feat_cache=None,  # This avoids the string comparison issues
-                feat_idx=[0]
-            )
-            outputs.append(frame_out)
-        
-        output = torch.cat(outputs, dim=2).float().clamp_(-1, 1)
-        
-        # from [1, num_channels, num_frames, height, width] 
-        # to [1, num_frames, num_channels, height, width]
+            decode_function = self.model.decode
+
+        output = []
+        for u in zs:
+            output.append(decode_function(u.unsqueeze(0), scale).float().clamp_(-1, 1).squeeze(0))
+        output = torch.stack(output, dim=0)
+        # from [batch_size, num_channels, num_frames, height, width]
+        # to [batch_size, num_frames, num_channels, height, width]
         output = output.permute(0, 2, 1, 3, 4)
         return output
 
