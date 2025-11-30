@@ -7,7 +7,7 @@
 set -e
 
 # Default config (can be overridden)
-CONFIG_PATH=${1:-"configs/interactive_inference.yaml"}
+CONFIG_PATH=${1:-"configs/longlive_interactive_inference.yaml"}
 OUTPUT_DIR=${2:-"/tmp/interactive_timing_results"}
 
 echo "Interactive Inference Timing Analysis"
