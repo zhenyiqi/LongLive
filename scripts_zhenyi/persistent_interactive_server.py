@@ -36,6 +36,11 @@ class PersistentInteractivePipeline:
         print("INITIALIZING PERSISTENT INTERACTIVE PIPELINE")
         print("="*60)
         
+        # Configure torch._dynamo to handle recompilation gracefully
+        import torch._dynamo
+        torch._dynamo.config.recompile_limit = 32  # Increase from default 8 to handle tensor variations
+        print(f"Set torch._dynamo.config.recompile_limit = {torch._dynamo.config.recompile_limit}")
+        
         # Load config
         self.config = OmegaConf.load(config_path)
         
@@ -121,6 +126,12 @@ class PersistentInteractivePipeline:
         
         print(f"\nRunning inference with {len(prompts_list)} segments...")
         print(f"Switch points: {switch_frame_indices}")
+        
+        # Clear VAE cache to prevent tensor size mismatches between runs
+        # This is crucial for torch.compile stability across different input sizes
+        if hasattr(self.pipeline.vae, 'model') and hasattr(self.pipeline.vae.model, 'clear_cache'):
+            print("Clearing VAE cache to ensure tensor size consistency...")
+            self.pipeline.vae.model.clear_cache()
         
         # Setup latency tracking if requested
         if enable_timing:
