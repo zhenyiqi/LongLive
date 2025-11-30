@@ -490,8 +490,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             frame_idx += current_num_frames
             block_idx += 1
 
-        # VAE decoding with timing
-        vae_decode_start = time.perf_counter()
+        # VAE preparation
         self._log_timing("Starting VAE decode...")
         
         with time_device_sync(latency_tracker, "interactive_vae_input_prep"):
@@ -499,8 +498,9 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             
         # H100 optimization using torch.compile (more reliable than FP8)
         
-        # Compile the VAE decoder for H100 optimization on first use
+        # Compile the VAE decoder for H100 optimization on first use (separate timing)
         if not hasattr(self, '_vae_compiled'):
+            compilation_start = time.perf_counter()
             self._log_timing("Compiling VAE decoder for H100...")
             try:
                 # Use torch.compile with H100 optimization, less aggressive to avoid sympy issues
@@ -511,11 +511,16 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                     fullgraph=False          # Allow graph breaks if needed
                 )
                 self._vae_compiled = True
-                self._log_timing("VAE decoder compilation successful")
+                compilation_time = (time.perf_counter() - compilation_start) * 1000
+                self._log_timing(f"VAE decoder compilation successful", compilation_time)
             except Exception as e:
-                self._log_timing(f"VAE compilation failed: {e}, using original decoder")
+                compilation_time = (time.perf_counter() - compilation_start) * 1000
+                self._log_timing(f"VAE compilation failed: {e}, using original decoder", compilation_time)
                 self.vae._compiled_decode = self.vae.decode_to_pixel
                 self._vae_compiled = False
+        
+        # VAE decode timing - ONLY the actual decode operation
+        vae_decode_start = time.perf_counter()
         
         # Use compiled decoder
         try:
@@ -537,12 +542,13 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                     video = self.vae.decode_to_pixel(output_for_vae, use_cache=False)
             else:
                 video = self.vae.decode_to_pixel(output_for_vae, use_cache=False)
+        
+        # End VAE decode timing - pure decode time only
+        vae_decode_time = (time.perf_counter() - vae_decode_start) * 1000
+        self._log_timing(f"VAE decode completed", vae_decode_time)
             
         with time_device_sync(latency_tracker, "interactive_vae_postprocess"):
             video = (video * 0.5 + 0.5).clamp(0, 1)
-        
-        vae_decode_time = (time.perf_counter() - vae_decode_start) * 1000
-        self._log_timing(f"VAE decode completed", vae_decode_time)
         
         # Complete timing and log summary
         generation_total_time = (time.perf_counter() - generation_start_time) * 1000
