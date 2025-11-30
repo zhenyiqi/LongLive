@@ -175,9 +175,8 @@ if args.enable_timing and COMPREHENSIVE_TIMING_AVAILABLE:
         os.makedirs(args.timing_output_dir, exist_ok=True)
     
     latency_tracker = ComprehensiveLatencyTracker(
-        device=device,
-        enable_detailed_logging=True,
-        output_dir=args.timing_output_dir
+        num_frame_per_block=config.num_frame_per_block,
+        device=device
     )
     
     if local_rank == 0:
@@ -245,12 +244,11 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
 
     # Run inference with timing
     if latency_tracker:
-        latency_tracker.set_current_prompt_info(
-            prompt_idx=idx,
-            prompts=prompts_list,
-            switch_indices=switch_frame_indices,
-            rank=rank
-        )
+        # Store current prompt info for analysis
+        latency_tracker.current_prompt_idx = idx
+        latency_tracker.current_prompts = prompts_list  
+        latency_tracker.current_switch_indices = switch_frame_indices
+        latency_tracker.current_rank = rank
 
     video = pipeline.inference_with_timing(
         noise=sampled_noise,
@@ -290,24 +288,30 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         timing_filename = f"interactive_timing_analysis_rank{rank}_prompt{idx}.json"
         timing_filepath = os.path.join(args.timing_output_dir, timing_filename)
         
-        analysis_data = latency_tracker.get_analysis()
+        analysis_data = latency_tracker.get_comprehensive_statistics()
         with open(timing_filepath, 'w') as f:
             json.dump(analysis_data, f, indent=2)
         
         print(f"\nTiming analysis saved to: {timing_filepath}")
         
         # Print brief summary
-        if "summary" in analysis_data:
-            summary = analysis_data["summary"]
+        if "performance_metrics" in analysis_data:
+            metrics = analysis_data["performance_metrics"]
             print("\nTIMING SUMMARY:")
-            print(f"  Total time: {summary.get('total_time_ms', 0):.2f} ms")
-            print(f"  Number of prompt switches: {summary.get('num_prompt_switches', 0)}")
-            print(f"  Average time per frame: {summary.get('avg_time_per_frame_ms', 0):.2f} ms")
+            print(f"  Total generation time: {metrics.get('total_generation_time_ms', 0):.2f} ms")
+            print(f"  Average time per frame: {metrics.get('avg_time_per_frame_ms', 0):.2f} ms")
+            print(f"  Total frames: {analysis_data.get('configuration', {}).get('total_frames', 0)}")
             
-            if "component_breakdown" in summary:
+            if "component_breakdown" in analysis_data:
                 print("\nTOP COMPONENTS BY TIME:")
-                for comp, time_ms in list(summary["component_breakdown"].items())[:5]:
-                    print(f"  {comp}: {time_ms:.2f} ms")
+                comp_data = analysis_data["component_breakdown"]
+                # Sort by mean GPU time and show top 5
+                sorted_components = sorted(
+                    [(name, data.get('gpu_times', {}).get('mean', 0)) for name, data in comp_data.items()],
+                    key=lambda x: x[1], reverse=True
+                )[:5]
+                for comp_name, mean_time in sorted_components:
+                    print(f"  {comp_name}: {mean_time:.2f} ms (avg)")
 
     if config.inference_iter != -1 and i >= config.inference_iter:
         break
