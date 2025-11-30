@@ -513,7 +513,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         self._log_timing(f"Interactive inference completed", generation_total_time)
         
         if latency_tracker:
-            latency_tracker.end_generation()
+            # Generation completed - timing data is already collected
             
             # Log timing summary
             print("\n" + "="*60)
