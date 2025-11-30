@@ -55,8 +55,8 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         self.latency_tracker = None
         self.enable_timing_logs = True
         
-        # Pre-compile models for H100 optimization (done once at initialization)
-        self._compile_models_for_h100()
+        # Compile text encoder and VAE, but not generator (CUDA Graphs issues with KV cache)
+        self._compile_safe_models_for_h100()
 
     def set_latency_tracker(self, tracker):
         """Set the comprehensive latency tracker"""
@@ -130,6 +130,68 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                 self._log_timing(f"VAE compilation failed: {e}, using original decoder", compilation_time)
                 self.vae._compiled_decode = self.vae.decode_to_pixel
                 self._vae_compiled = False
+    
+    def _setup_uncompiled_models(self):
+        """Setup models without compilation (fallback for CUDA Graphs issues)"""
+        self._log_timing("Setting up models without compilation (avoiding CUDA Graphs issues)")
+        
+        # Set up uncompiled forwards as direct references
+        self._text_encoder_compiled = False
+        self.text_encoder._compiled_forward = self.text_encoder.__call__
+        
+        self._generator_compiled = False  
+        self.generator._compiled_forward = self.generator.__call__
+        
+        self._vae_compiled = False
+        self.vae._compiled_decode = self.vae.decode_to_pixel
+        
+        self._log_timing("Models ready (uncompiled)")
+    
+    def _compile_safe_models_for_h100(self):
+        """Compile only text encoder and VAE (avoid generator CUDA Graphs issues)"""
+        
+        # Compile text encoder (this worked in your logs)
+        compilation_start = time.perf_counter()
+        self._log_timing("Compiling text encoder for H100...")
+        try:
+            self.text_encoder._compiled_forward = torch.compile(
+                self.text_encoder.__call__,
+                mode="reduce-overhead",
+                dynamic=False,
+                fullgraph=False
+            )
+            self._text_encoder_compiled = True
+            compilation_time = (time.perf_counter() - compilation_start) * 1000
+            self._log_timing(f"Text encoder compilation successful", compilation_time)
+        except Exception as e:
+            compilation_time = (time.perf_counter() - compilation_start) * 1000
+            self._log_timing(f"Text encoder compilation failed: {e}", compilation_time)
+            self.text_encoder._compiled_forward = self.text_encoder.__call__
+            self._text_encoder_compiled = False
+        
+        # DON'T compile generator (causes CUDA Graphs issues)
+        self._log_timing("Skipping generator compilation (avoiding CUDA Graphs issues)")
+        self._generator_compiled = False  
+        self.generator._compiled_forward = self.generator.__call__
+        
+        # Compile VAE decoder (this should work)
+        compilation_start = time.perf_counter()
+        self._log_timing("Compiling VAE decoder for H100...")
+        try:
+            self.vae._compiled_decode = torch.compile(
+                self.vae.decode_to_pixel,
+                mode="reduce-overhead",
+                dynamic=False,
+                fullgraph=False
+            )
+            self._vae_compiled = True
+            compilation_time = (time.perf_counter() - compilation_start) * 1000
+            self._log_timing(f"VAE decoder compilation successful", compilation_time)
+        except Exception as e:
+            compilation_time = (time.perf_counter() - compilation_start) * 1000
+            self._log_timing(f"VAE compilation failed: {e}, using original decoder", compilation_time)
+            self.vae._compiled_decode = self.vae.decode_to_pixel
+            self._vae_compiled = False
             
     def _log_timing(self, message: str, elapsed_ms: float = None):
         """Log timing information"""
