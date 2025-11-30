@@ -54,6 +54,9 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         # Initialize latency tracking
         self.latency_tracker = None
         self.enable_timing_logs = True
+        
+        # Pre-compile models for H100 optimization (done once at initialization)
+        self._compile_models_for_h100()
 
     def set_latency_tracker(self, tracker):
         """Set the comprehensive latency tracker"""
@@ -64,6 +67,69 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             self.text_encoder.latency_tracker = tracker
             self.generator.latency_tracker = tracker  
             self.vae.latency_tracker = tracker
+            
+    def _compile_models_for_h100(self):
+        """Compile major models for H100 optimization"""
+        
+        # Compile text encoder
+        if not hasattr(self, '_text_encoder_compiled'):
+            compilation_start = time.perf_counter()
+            self._log_timing("Compiling text encoder for H100...")
+            try:
+                self.text_encoder._compiled_forward = torch.compile(
+                    self.text_encoder.__call__,
+                    mode="reduce-overhead",
+                    dynamic=False,
+                    fullgraph=False
+                )
+                self._text_encoder_compiled = True
+                compilation_time = (time.perf_counter() - compilation_start) * 1000
+                self._log_timing(f"Text encoder compilation successful", compilation_time)
+            except Exception as e:
+                compilation_time = (time.perf_counter() - compilation_start) * 1000
+                self._log_timing(f"Text encoder compilation failed: {e}", compilation_time)
+                self.text_encoder._compiled_forward = self.text_encoder.__call__
+                self._text_encoder_compiled = False
+        
+        # Compile generator/diffusion model
+        if not hasattr(self, '_generator_compiled'):
+            compilation_start = time.perf_counter()
+            self._log_timing("Compiling generator for H100...")
+            try:
+                self.generator._compiled_forward = torch.compile(
+                    self.generator.__call__,
+                    mode="reduce-overhead", 
+                    dynamic=False,
+                    fullgraph=False
+                )
+                self._generator_compiled = True
+                compilation_time = (time.perf_counter() - compilation_start) * 1000
+                self._log_timing(f"Generator compilation successful", compilation_time)
+            except Exception as e:
+                compilation_time = (time.perf_counter() - compilation_start) * 1000
+                self._log_timing(f"Generator compilation failed: {e}", compilation_time)
+                self.generator._compiled_forward = self.generator.__call__
+                self._generator_compiled = False
+        
+        # Compile VAE decoder
+        if not hasattr(self, '_vae_compiled'):
+            compilation_start = time.perf_counter()
+            self._log_timing("Compiling VAE decoder for H100...")
+            try:
+                self.vae._compiled_decode = torch.compile(
+                    self.vae.decode_to_pixel,
+                    mode="reduce-overhead",
+                    dynamic=False,
+                    fullgraph=False
+                )
+                self._vae_compiled = True
+                compilation_time = (time.perf_counter() - compilation_start) * 1000
+                self._log_timing(f"VAE decoder compilation successful", compilation_time)
+            except Exception as e:
+                compilation_time = (time.perf_counter() - compilation_start) * 1000
+                self._log_timing(f"VAE compilation failed: {e}, using original decoder", compilation_time)
+                self.vae._compiled_decode = self.vae.decode_to_pixel
+                self._vae_compiled = False
             
     def _log_timing(self, message: str, elapsed_ms: float = None):
         """Log timing information"""
@@ -277,12 +343,21 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         if latency_tracker and COMPREHENSIVE_TIMING_AVAILABLE:
             cond_list = []
             for i, prompts in enumerate(text_prompts_list):
+                encoding_start = time.perf_counter()
                 with latency_tracker.time_component('interactive_text_encoding', 
                                                    segment_idx=i, 
-                                                   num_prompts=len(prompts)):
-                    cond_list.append(self.text_encoder(text_prompts=prompts))
+                                                   num_prompts=len(prompts),
+                                                   compiled=self._text_encoder_compiled):
+                    cond_list.append(self.text_encoder._compiled_forward(text_prompts=prompts))
+                encoding_time = (time.perf_counter() - encoding_start) * 1000
+                self._log_timing(f"Segment {i} encoded", encoding_time)
         else:
-            cond_list = [self.text_encoder(text_prompts=p) for p in text_prompts_list]
+            cond_list = []
+            for i, prompts in enumerate(text_prompts_list):
+                encoding_start = time.perf_counter()
+                cond_list.append(self.text_encoder._compiled_forward(text_prompts=prompts))
+                encoding_time = (time.perf_counter() - encoding_start) * 1000
+                self._log_timing(f"Segment {i} encoded", encoding_time)
             
         prompt_encoding_time = (time.perf_counter() - prompt_encoding_start) * 1000
         self._log_timing(f"All prompts encoded", prompt_encoding_time)
@@ -396,8 +471,9 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                                                           step_index=index, 
                                                           block_idx=block_idx,
                                                           segment_idx=segment_idx,
-                                                          is_final_step=False):
-                            _, denoised_pred = self.generator(
+                                                          is_final_step=False,
+                                                          compiled=self._generator_compiled):
+                            _, denoised_pred = self.generator._compiled_forward(
                                 noisy_image_or_video=noisy_input,
                                 conditional_dict=cond_in_use,
                                 timestep=timestep,
@@ -406,7 +482,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                                 current_start=current_start_frame * self.frame_seq_length,
                             )
                     else:
-                        _, denoised_pred = self.generator(
+                        _, denoised_pred = self.generator._compiled_forward(
                             noisy_image_or_video=noisy_input,
                             conditional_dict=cond_in_use,
                             timestep=timestep,
@@ -433,8 +509,9 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                                                           step_index=index,
                                                           block_idx=block_idx,
                                                           segment_idx=segment_idx,
-                                                          is_final_step=True):
-                            _, denoised_pred = self.generator(
+                                                          is_final_step=True,
+                                                          compiled=self._generator_compiled):
+                            _, denoised_pred = self.generator._compiled_forward(
                                 noisy_image_or_video=noisy_input,
                                 conditional_dict=cond_in_use,
                                 timestep=timestep,
@@ -443,7 +520,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                                 current_start=current_start_frame * self.frame_seq_length,
                             )
                     else:
-                        _, denoised_pred = self.generator(
+                        _, denoised_pred = self.generator._compiled_forward(
                             noisy_image_or_video=noisy_input,
                             conditional_dict=cond_in_use,
                             timestep=timestep,
@@ -468,8 +545,9 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             with time_kv_operations(latency_tracker, "interactive_kv_cache_update", 
                                   block_idx=block_idx, 
                                   segment_idx=segment_idx,
-                                  context_noise=self.args.context_noise):
-                self.generator(
+                                  context_noise=self.args.context_noise,
+                                  compiled=self._generator_compiled):
+                self.generator._compiled_forward(
                     noisy_image_or_video=denoised_pred,
                     conditional_dict=cond_in_use,
                     timestep=context_timestep,
@@ -496,30 +574,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         with time_device_sync(latency_tracker, "interactive_vae_input_prep"):
             output_for_vae = output.to(noise.device)
             
-        # H100 optimization using torch.compile (more reliable than FP8)
-        
-        # Compile the VAE decoder for H100 optimization on first use (separate timing)
-        if not hasattr(self, '_vae_compiled'):
-            compilation_start = time.perf_counter()
-            self._log_timing("Compiling VAE decoder for H100...")
-            try:
-                # Use torch.compile with H100 optimization, less aggressive to avoid sympy issues
-                self.vae._compiled_decode = torch.compile(
-                    self.vae.decode_to_pixel,
-                    mode="reduce-overhead",  # Less aggressive than max-autotune, more stable
-                    dynamic=False,           # Fixed input sizes for better optimization
-                    fullgraph=False          # Allow graph breaks if needed
-                )
-                self._vae_compiled = True
-                compilation_time = (time.perf_counter() - compilation_start) * 1000
-                self._log_timing(f"VAE decoder compilation successful", compilation_time)
-            except Exception as e:
-                compilation_time = (time.perf_counter() - compilation_start) * 1000
-                self._log_timing(f"VAE compilation failed: {e}, using original decoder", compilation_time)
-                self.vae._compiled_decode = self.vae.decode_to_pixel
-                self._vae_compiled = False
-        
-        # VAE decode timing - ONLY the actual decode operation
+        # VAE decode timing - ONLY the actual decode operation (models already compiled)
         vae_decode_start = time.perf_counter()
         
         # Use compiled decoder
