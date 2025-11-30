@@ -98,6 +98,7 @@ else:
     print(f"Single GPU mode on device {device}")
 
 low_memory = get_cuda_free_memory_gb(device) < 40
+print(f"{low_memory=}")
 torch.set_grad_enabled(False)
 
 # ----------------------------- Initialize Pipeline -----------------------------

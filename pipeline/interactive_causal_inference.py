@@ -174,19 +174,19 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         self._generator_compiled = False  
         self.generator._compiled_forward = self.generator.__call__
         
-        # Compile VAE decoder with dynamic shapes to prevent recompilation
+        # Compile VAE decoder - now CUDA Graph compatible with buffers and no Python loop
         compilation_start = time.perf_counter()
-        self._log_timing("Compiling VAE decoder for H100...")
+        self._log_timing("Compiling VAE decoder for H100 (CUDA Graph compatible)...")
         try:
             self.vae._compiled_decode = torch.compile(
                 self.vae.decode_to_pixel,
                 mode="reduce-overhead", 
-                dynamic=True,  # Enable dynamic shapes to avoid tensor size mismatch recompilations
-                fullgraph=False
+                dynamic=False,  # Static shapes with batch_size=1, should work with CUDA Graphs now
+                fullgraph=True   # Try full graph since we removed Python loops
             )
             self._vae_compiled = True
             compilation_time = (time.perf_counter() - compilation_start) * 1000
-            self._log_timing(f"VAE decoder compilation successful (dynamic shapes)", compilation_time)
+            self._log_timing(f"VAE decoder compilation successful (CUDA Graph ready)", compilation_time)
         except Exception as e:
             compilation_time = (time.perf_counter() - compilation_start) * 1000
             self._log_timing(f"VAE compilation failed: {e}, using original decoder", compilation_time)

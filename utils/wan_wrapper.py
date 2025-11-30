@@ -68,8 +68,10 @@ class WanVAEWrapper(torch.nn.Module):
             2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
             3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160
         ]
-        self.mean = torch.tensor(mean, dtype=torch.float32)
-        self.std = torch.tensor(std, dtype=torch.float32)
+        
+        # Register as buffers so they automatically move with model and work with CUDA Graphs
+        self.register_buffer('mean', torch.tensor(mean, dtype=torch.float32))
+        self.register_buffer('std', torch.tensor(std, dtype=torch.float32))
 
         # init model
         self.model = _video_vae(
@@ -79,40 +81,42 @@ class WanVAEWrapper(torch.nn.Module):
 
     def encode_to_latent(self, pixel: torch.Tensor) -> torch.Tensor:
         # pixel: [batch_size, num_channels, num_frames, height, width]
-        device, dtype = pixel.device, pixel.dtype
-        scale = [self.mean.to(device=device, dtype=dtype),
-                 1.0 / self.std.to(device=device, dtype=dtype)]
+        # Enforce batch size = 1 for CUDA Graph compatibility
+        assert pixel.shape[0] == 1, "Batch size must be 1 for CUDA Graph compatibility"
+        
+        dtype = pixel.dtype
+        # Use registered buffers - no device transfers needed, CUDA Graph friendly
+        scale = [self.mean.to(dtype=dtype), 1.0 / self.std.to(dtype=dtype)]
 
-        output = [
-            self.model.encode(u.unsqueeze(0), scale).float().squeeze(0)
-            for u in pixel
-        ]
-        output = torch.stack(output, dim=0)
-        # from [batch_size, num_channels, num_frames, height, width]
-        # to [batch_size, num_frames, num_channels, height, width]
+        # Process single batch element directly - no Python loop
+        output = self.model.encode(pixel[0].unsqueeze(0), scale).float()
+        
+        # from [1, num_channels, num_frames, height, width]
+        # to [1, num_frames, num_channels, height, width]
         output = output.permute(0, 2, 1, 3, 4)
         return output
 
     def decode_to_pixel(self, latent: torch.Tensor, use_cache: bool = False) -> torch.Tensor:
+        # Enforce batch size = 1 for CUDA Graph compatibility and remove Python loop
+        assert latent.shape[0] == 1, "Batch size must be 1 for CUDA Graph compatibility"
+        
         zs = latent.permute(0, 2, 1, 3, 4)
-        if use_cache:
-            assert latent.shape[0] == 1, "Batch size must be 1 when using cache"
-
-        device, dtype = latent.device, latent.dtype
-        scale = [self.mean.to(device=device, dtype=dtype),
-                 1.0 / self.std.to(device=device, dtype=dtype)]
+        dtype = latent.dtype
+        
+        # Use registered buffers - no device transfers needed, CUDA Graph friendly
+        scale = [self.mean.to(dtype=dtype), 1.0 / self.std.to(dtype=dtype)]
 
         if use_cache:
             decode_function = self.model.cached_decode
         else:
             decode_function = self.model.decode
 
-        output = []
-        for u in zs:
-            output.append(decode_function(u.unsqueeze(0), scale).float().clamp_(-1, 1).squeeze(0))
-        output = torch.stack(output, dim=0)
-        # from [batch_size, num_channels, num_frames, height, width]
-        # to [batch_size, num_frames, num_channels, height, width]
+        # Process single batch element directly - no Python loop
+        # Since batch_size=1, zs[0] is the single element
+        output = decode_function(zs[0].unsqueeze(0), scale).float().clamp_(-1, 1)
+        
+        # from [1, num_channels, num_frames, height, width] 
+        # to [1, num_frames, num_channels, height, width]
         output = output.permute(0, 2, 1, 3, 4)
         return output
 
