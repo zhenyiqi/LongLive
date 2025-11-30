@@ -497,27 +497,52 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         with time_device_sync(latency_tracker, "interactive_vae_input_prep"):
             output_for_vae = output.to(noise.device)
             
-        # Chunked VAE decode for better memory efficiency and potential speed improvement
-        chunk_size = 60  # Process 60 frames at a time (quarter of total)
-        video_chunks = []
-        
-        for chunk_start in range(0, num_output_frames, chunk_size):
-            chunk_end = min(chunk_start + chunk_size, num_output_frames)
-            chunk_latents = output_for_vae[:, chunk_start:chunk_end]
+        # H100 FP8 optimization for VAE decode
+        try:
+            from transformer_engine import pytorch as te
+            # Configure FP8 recipe for H100 optimal settings
+            fp8_recipe = te.recipe.DelayedScaling(
+                margin=0,
+                interval=1,
+                fp8_format=te.recipe.Format.E4M3,  # E4M3 for activations
+                amax_history_len=1,
+                amax_compute_algo="most_recent"
+            )
             
-            if latency_tracker and COMPREHENSIVE_TIMING_AVAILABLE:
-                with latency_tracker.time_component('interactive_vae_decode_chunk', 
-                                                  chunk_idx=chunk_start//chunk_size,
-                                                  chunk_frames=chunk_end-chunk_start,
-                                                  total_chunks=(num_output_frames + chunk_size - 1) // chunk_size):
-                    chunk_video = self.vae.decode_to_pixel(chunk_latents, use_cache=False)
-            else:
-                chunk_video = self.vae.decode_to_pixel(chunk_latents, use_cache=False)
-                
-            video_chunks.append(chunk_video)
-            
-        # Concatenate all chunks
-        video = torch.cat(video_chunks, dim=1)
+            # Pre-allocate FP8 state for efficiency
+            with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+                self._log_timing("Using Transformer Engine FP8 on H100")
+                if latency_tracker and COMPREHENSIVE_TIMING_AVAILABLE:
+                    with latency_tracker.time_component('interactive_vae_decode_fp8_h100', 
+                                                      num_frames=num_output_frames,
+                                                      input_shape=list(output.shape),
+                                                      fp8_format="E4M3"):
+                        video = self.vae.decode_to_pixel(output_for_vae, use_cache=False)
+                else:
+                    video = self.vae.decode_to_pixel(output_for_vae, use_cache=False)
+                    
+        except ImportError:
+            # Fallback to PyTorch native FP8
+            self._log_timing("Transformer Engine not available, trying PyTorch FP8")
+            try:
+                with torch.autocast(device_type='cuda', dtype=torch.float8_e4m3fn, enabled=True):
+                    if latency_tracker and COMPREHENSIVE_TIMING_AVAILABLE:
+                        with latency_tracker.time_component('interactive_vae_decode_torch_fp8', 
+                                                          num_frames=num_output_frames,
+                                                          input_shape=list(output.shape)):
+                            video = self.vae.decode_to_pixel(output_for_vae, use_cache=False)
+                    else:
+                        video = self.vae.decode_to_pixel(output_for_vae, use_cache=False)
+            except Exception as e:
+                # Final fallback
+                self._log_timing(f"FP8 failed ({e}), using default precision")
+                if latency_tracker and COMPREHENSIVE_TIMING_AVAILABLE:
+                    with latency_tracker.time_component('interactive_vae_decode_fallback', 
+                                                      num_frames=num_output_frames,
+                                                      input_shape=list(output.shape)):
+                        video = self.vae.decode_to_pixel(output_for_vae, use_cache=False)
+                else:
+                    video = self.vae.decode_to_pixel(output_for_vae, use_cache=False)
             
         with time_device_sync(latency_tracker, "interactive_vae_postprocess"):
             video = (video * 0.5 + 0.5).clamp(0, 1)
