@@ -37,3 +37,9 @@ adapter:
   dtype: "bfloat16"          # Data type for LoRA parameters: "bfloat16", "float16", "float32"
   verbose: false              # Whether to print all target module names
 
+
+quantization:
+  enabled: true               # Enable quantization
+  method: "bnb"               # Use bitsandbytes GPU quantization
+  dtype: "int8"               # "int8" (Linear8bitLt) or "int4" (Linear4bit nf4)
+  models: ["generator", "text_encoder"]  # Which components to quantize
