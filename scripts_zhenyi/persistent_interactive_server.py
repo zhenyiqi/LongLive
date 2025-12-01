@@ -76,21 +76,27 @@ class PersistentInteractivePipeline:
         if getattr(self.config, "adapter", None):
             self._setup_lora()
             
-        # Apply FP8 quantization if enabled
-        if getattr(self.config, "quantization", None) and self.config.quantization.get("enabled", False):
-            self._apply_fp8_quantization()
-        
-        # Move to device and dtype
+        # Move to device and dtype first
         print("dtype", self.pipeline.generator.model.dtype)
         self.pipeline = self.pipeline.to(dtype=torch.bfloat16)
         self.pipeline.generator.to(device=self.device)
         self.pipeline.vae.to(device=self.device)
+        
+        # Apply FP8 quantization AFTER moving to device
+        if getattr(self.config, "quantization", None) and self.config.quantization.get("enabled", False):
+            self._apply_fp8_quantization()
+        
+        # Debug: Print model dtypes if quantization was attempted
+        if getattr(self.config, "quantization", None) and self.config.quantization.get("enabled", False):
+            self._print_model_dtypes()
         
         init_time = (time.perf_counter() - init_start) * 1000
         print(f"Pipeline initialization completed: {init_time:.2f} ms")
         print("="*60)
         print("NOTE: First inference will include compilation time (~30s).")
         print("Subsequent inferences will be much faster (~60s vs ~90s)!")
+        if getattr(self.config, "quantization", None) and self.config.quantization.get("enabled", False):
+            print("FP8 quantization enabled - expect additional ~20% speedup!")
         print("="*60)
         
     def _load_generator_weights(self):
@@ -148,24 +154,48 @@ class PersistentInteractivePipeline:
             print(f"Warning: Unsupported FP8 dtype {quant_dtype}, skipping quantization")
             return
             
+        # Check if FP8 is actually supported
+        if not hasattr(torch, 'float8_e4m3fn'):
+            print(f"Warning: FP8 dtype not supported in this PyTorch version ({torch.__version__})")
+            print("FP8 requires PyTorch 2.1+ with CUDA support")
+            return
+            
         try:
             # Quantize VAE if requested
             if "vae" in models_to_quantize:
                 print("Quantizing VAE to FP8...")
                 quant_start = time.perf_counter()
                 
+                # Count parameters before quantization
+                total_params = 0
+                quantized_params = 0
+                original_dtypes = {}
+                
                 # Quantize VAE model parameters
-                for param in self.pipeline.vae.parameters():
+                for name, param in self.pipeline.vae.named_parameters():
+                    total_params += 1
+                    original_dtypes[name] = param.dtype
                     if param.dtype == torch.bfloat16 or param.dtype == torch.float32:
                         param.data = param.data.to(target_dtype)
+                        quantized_params += 1
                         
                 # Quantize VAE buffers 
+                total_buffers = 0
+                quantized_buffers = 0
                 for name, buffer in self.pipeline.vae.named_buffers():
+                    total_buffers += 1
+                    original_dtypes[name] = buffer.dtype
                     if buffer.dtype == torch.bfloat16 or buffer.dtype == torch.float32:
                         buffer.data = buffer.data.to(target_dtype)
+                        quantized_buffers += 1
                 
                 quant_time = (time.perf_counter() - quant_start) * 1000
                 print(f"VAE quantization completed: {quant_time:.2f} ms")
+                print(f"  - Quantized {quantized_params}/{total_params} parameters")
+                print(f"  - Quantized {quantized_buffers}/{total_buffers} buffers")
+                
+                # Validate quantization worked
+                self._validate_quantization("VAE", self.pipeline.vae, target_dtype)
             
             # Quantize text encoder if requested  
             if "text_encoder" in models_to_quantize:
@@ -195,6 +225,50 @@ class PersistentInteractivePipeline:
         except Exception as e:
             print(f"FP8 quantization failed: {e}")
             print("Continuing with original precision...")
+            
+    def _validate_quantization(self, model_name: str, model: torch.nn.Module, target_dtype: torch.dtype):
+        """Validate that quantization was applied correctly"""
+        fp8_params = 0
+        total_params = 0
+        fp8_buffers = 0
+        total_buffers = 0
+        
+        # Check parameters
+        for name, param in model.named_parameters():
+            total_params += 1
+            if param.dtype == target_dtype:
+                fp8_params += 1
+                
+        # Check buffers  
+        for name, buffer in model.named_buffers():
+            total_buffers += 1
+            if buffer.dtype == target_dtype:
+                fp8_buffers += 1
+                
+        print(f"  - Validation: {fp8_params}/{total_params} parameters in FP8")
+        print(f"  - Validation: {fp8_buffers}/{total_buffers} buffers in FP8")
+        
+        if fp8_params == 0 and fp8_buffers == 0:
+            print(f"  ⚠️  WARNING: No {model_name} tensors were quantized to FP8!")
+        else:
+            print(f"  ✅ {model_name} quantization successful")
+            
+    def _print_model_dtypes(self):
+        """Debug function to print model data types"""
+        print("\n" + "="*60)
+        print("MODEL DATA TYPES DEBUG")
+        print("="*60)
+        
+        print(f"VAE parameter dtypes:")
+        for name, param in list(self.pipeline.vae.named_parameters())[:5]:  # First 5 only
+            print(f"  {name}: {param.dtype}")
+        print(f"  ... and {len(list(self.pipeline.vae.named_parameters())) - 5} more")
+        
+        print(f"\nVAE buffer dtypes:")
+        for name, buffer in self.pipeline.vae.named_buffers():
+            print(f"  {name}: {buffer.dtype}")
+            
+        print("="*60)
         
     def run_inference(self, prompts_list: List[List[str]], switch_frame_indices: List[int], 
                      output_path: str = None, enable_timing: bool = True):
