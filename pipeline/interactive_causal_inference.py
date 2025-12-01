@@ -50,6 +50,8 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
     ):
         super().__init__(args, device, generator=generator, text_encoder=text_encoder, vae=vae)
         self.global_sink = getattr(args, "global_sink", False)
+        # Cache for blockwise causal attention masks keyed by (device, num_frames, frame_seqlen, num_frame_per_block, local_attn_size)
+        self._block_mask_cache = {}
         
         # Initialize latency tracking
         self.latency_tracker = None
@@ -130,6 +132,26 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                 self._log_timing(f"VAE compilation failed: {e}, using original decoder", compilation_time)
                 self.vae._compiled_decode = self.vae.decode_to_pixel
                 self._vae_compiled = False
+    
+    def _get_block_mask(self, device, num_frames: int, local_attn_size: int | None = None):
+        """
+        Retrieve a cached blockwise causal attention mask if available; otherwise build and cache it.
+        The mask depends on device, num_frames, frame_seqlen, num_frame_per_block, and local_attn_size.
+        """
+        if local_attn_size is None:
+            local_attn_size = self.local_attn_size
+        key = (str(device), int(num_frames), int(self.frame_seq_length), int(self.num_frame_per_block), int(local_attn_size))
+        mask = self._block_mask_cache.get(key, None)
+        if mask is None:
+            mask = self.generator.model._prepare_blockwise_causal_attn_mask(
+                device=device,
+                num_frames=num_frames,
+                frame_seqlen=self.frame_seq_length,
+                num_frame_per_block=self.num_frame_per_block,
+                local_attn_size=local_attn_size
+            )
+            self._block_mask_cache[key] = mask
+        return mask
     
     def _setup_uncompiled_models(self):
         """Setup models without compilation (fallback for CUDA Graphs issues)"""
@@ -251,11 +273,9 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         
         with time_attention_kernel(self.latency_tracker, operation="prompt_switch_mask_prep",
                                  segment_idx=segment_idx, num_frames=num_recache_frames):
-            block_mask = self.generator.model._prepare_blockwise_causal_attn_mask(
+            block_mask = self._get_block_mask(
                 device=device,
                 num_frames=num_recache_frames,
-                frame_seqlen=self.frame_seq_length,
-                num_frame_per_block=self.num_frame_per_block,
                 local_attn_size=self.local_attn_size
             )
         
