@@ -14,6 +14,14 @@ EXTRA_ARGS=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --quantize)
+            EXTRA_ARGS="$EXTRA_ARGS --quantize"
+            shift
+            ;;
+        --no-quantize)
+            EXTRA_ARGS="$EXTRA_ARGS --no-quantize"
+            shift
+            ;;
         --fp8)
             EXTRA_ARGS="$EXTRA_ARGS --fp8"
             shift
@@ -72,8 +80,10 @@ if [ "$MODE" = "help" ]; then
     echo "Usage: $0 [options] [config_path] [mode] [data_path] [output_dir]"
     echo ""
     echo "Options:"
-    echo "  --fp8                Enable FP8 quantization (overrides config)"
-    echo "  --no-fp8             Disable FP8 quantization (overrides config)"
+    echo "  --quantize           Enable INT8 quantization (overrides config)" 
+    echo "  --no-quantize        Disable quantization (overrides config)"
+    echo "  --fp8                Enable quantization (legacy flag)"
+    echo "  --no-fp8             Disable quantization (legacy flag)"
     echo "  --config PATH        Configuration file path"
     echo "  --mode MODE          Mode: interactive, data, help"
     echo "  --data-path PATH     Data file path (for data mode)"
@@ -86,7 +96,7 @@ if [ "$MODE" = "help" ]; then
     echo ""
     echo "Examples:"
     echo "  $0                                          # Interactive mode with default config"
-    echo "  $0 --fp8                                    # Interactive mode with FP8 quantization"
+    echo "  $0 --quantize                               # Interactive mode with INT8 quantization"
     echo "  $0 --config configs/my_config.yaml         # Custom config"
     echo "  $0 --mode data --data-path /path/to/data.txt # Run once on data file"
     echo ""

@@ -41,15 +41,21 @@ class PersistentInteractivePipeline:
         
         # Override quantization config with CLI args if provided
         if cli_args:
-            if cli_args.fp8:
+            # Check both new and legacy flags
+            enable_quant = cli_args.quantize or cli_args.fp8
+            disable_quant = cli_args.no_quantize or cli_args.no_fp8
+            
+            if enable_quant:
                 if not hasattr(self.config, 'quantization'):
                     self.config.quantization = {}
                 self.config.quantization.enabled = True
-                print("FP8 quantization enabled via --fp8 flag")
-            elif cli_args.no_fp8:
+                flag_used = "--quantize" if cli_args.quantize else "--fp8"
+                print(f"Quantization enabled via {flag_used} flag")
+            elif disable_quant:
                 if hasattr(self.config, 'quantization'):
                     self.config.quantization.enabled = False
-                print("FP8 quantization disabled via --no-fp8 flag")
+                flag_used = "--no-quantize" if cli_args.no_quantize else "--no-fp8"
+                print(f"Quantization disabled via {flag_used} flag")
         
         # Setup device
         if "LOCAL_RANK" in os.environ:
@@ -439,10 +445,15 @@ def main():
                        help="Run inference on data file and exit")
     parser.add_argument("--output_dir", type=str, default="/tmp/persistent_outputs",
                        help="Output directory for videos")
+    parser.add_argument("--quantize", action="store_true",
+                       help="Enable quantization (overrides config)")
+    parser.add_argument("--no-quantize", action="store_true",
+                       help="Disable quantization (overrides config)")
+    # Legacy flags for backward compatibility
     parser.add_argument("--fp8", action="store_true",
-                       help="Enable FP8 quantization (overrides config)")
+                       help="Enable quantization (legacy flag)")
     parser.add_argument("--no-fp8", action="store_true",
-                       help="Disable FP8 quantization (overrides config)")
+                       help="Disable quantization (legacy flag)")
     args = parser.parse_args()
     
     # Initialize persistent pipeline
