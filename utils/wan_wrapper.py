@@ -101,8 +101,19 @@ class WanVAEWrapper(torch.nn.Module):
             assert latent.shape[0] == 1, "Batch size must be 1 when using cache"
 
         device, dtype = latent.device, latent.dtype
-        scale = [self.mean.to(device=device, dtype=dtype),
-                 1.0 / self.std.to(device=device, dtype=dtype)]
+        
+        # Check if VAE model is quantized to FP8 and adjust input dtype accordingly
+        model_dtype = next(self.model.parameters()).dtype
+        if model_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            # Convert inputs to match quantized model
+            input_dtype = model_dtype
+            print(f"[VAE] Converting inputs to {model_dtype} to match quantized model")
+        else:
+            # Keep original dtype
+            input_dtype = dtype
+            
+        scale = [self.mean.to(device=device, dtype=input_dtype),
+                 1.0 / self.std.to(device=device, dtype=input_dtype)]
 
         if use_cache:
             decode_function = self.model.cached_decode
@@ -111,7 +122,10 @@ class WanVAEWrapper(torch.nn.Module):
 
         output = []
         for u in zs:
-            output.append(decode_function(u.unsqueeze(0), scale).float().clamp_(-1, 1).squeeze(0))
+            # Convert input to match model dtype
+            u_input = u.to(dtype=input_dtype) if input_dtype != dtype else u
+            result = decode_function(u_input.unsqueeze(0), scale).float().clamp_(-1, 1).squeeze(0)
+            output.append(result)
         output = torch.stack(output, dim=0)
         # from [batch_size, num_channels, num_frames, height, width]
         # to [batch_size, num_frames, num_channels, height, width]

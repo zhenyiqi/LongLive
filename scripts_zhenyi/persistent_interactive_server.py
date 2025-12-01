@@ -166,33 +166,18 @@ class PersistentInteractivePipeline:
                 print("Quantizing VAE to FP8...")
                 quant_start = time.perf_counter()
                 
-                # Count parameters before quantization
-                total_params = 0
-                quantized_params = 0
-                original_dtypes = {}
-                
-                # Quantize VAE model parameters
-                for name, param in self.pipeline.vae.named_parameters():
-                    total_params += 1
-                    original_dtypes[name] = param.dtype
-                    if param.dtype == torch.bfloat16 or param.dtype == torch.float32:
-                        param.data = param.data.to(target_dtype)
-                        quantized_params += 1
-                        
-                # Quantize VAE buffers 
-                total_buffers = 0
-                quantized_buffers = 0
-                for name, buffer in self.pipeline.vae.named_buffers():
-                    total_buffers += 1
-                    original_dtypes[name] = buffer.dtype
-                    if buffer.dtype == torch.bfloat16 or buffer.dtype == torch.float32:
-                        buffer.data = buffer.data.to(target_dtype)
-                        quantized_buffers += 1
+                # Use PyTorch's built-in quantization if available, otherwise manual conversion
+                if hasattr(torch.nn.utils, 'convert_to_float8'):
+                    # Use PyTorch's native FP8 conversion if available
+                    print("Using PyTorch native FP8 conversion")
+                    torch.nn.utils.convert_to_float8(self.pipeline.vae, dtype=target_dtype)
+                else:
+                    # Manual conversion with comprehensive dtype matching
+                    print("Using manual FP8 conversion")
+                    self._manual_fp8_conversion(self.pipeline.vae, target_dtype)
                 
                 quant_time = (time.perf_counter() - quant_start) * 1000
                 print(f"VAE quantization completed: {quant_time:.2f} ms")
-                print(f"  - Quantized {quantized_params}/{total_params} parameters")
-                print(f"  - Quantized {quantized_buffers}/{total_buffers} buffers")
                 
                 # Validate quantization worked
                 self._validate_quantization("VAE", self.pipeline.vae, target_dtype)
@@ -226,6 +211,30 @@ class PersistentInteractivePipeline:
             print(f"FP8 quantization failed: {e}")
             print("Continuing with original precision...")
             
+    def _manual_fp8_conversion(self, model: torch.nn.Module, target_dtype: torch.dtype):
+        """Manual FP8 conversion ensuring all tensors have consistent dtype"""
+        total_params = 0
+        quantized_params = 0
+        total_buffers = 0 
+        quantized_buffers = 0
+        
+        # Convert all parameters
+        for name, param in model.named_parameters():
+            total_params += 1
+            if param.dtype in (torch.bfloat16, torch.float32, torch.float16):
+                param.data = param.data.to(target_dtype)
+                quantized_params += 1
+                
+        # Convert all buffers (including mean/std we registered)
+        for name, buffer in model.named_buffers():
+            total_buffers += 1
+            if buffer.dtype in (torch.bfloat16, torch.float32, torch.float16):
+                buffer.data = buffer.data.to(target_dtype)
+                quantized_buffers += 1
+                
+        print(f"  - Quantized {quantized_params}/{total_params} parameters")
+        print(f"  - Quantized {quantized_buffers}/{total_buffers} buffers")
+        
     def _validate_quantization(self, model_name: str, model: torch.nn.Module, target_dtype: torch.dtype):
         """Validate that quantization was applied correctly"""
         fp8_params = 0

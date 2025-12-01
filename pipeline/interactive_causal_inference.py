@@ -199,8 +199,8 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         self._generator_compiled = False  
         self.generator._compiled_forward = self.generator.__call__
         
-        # Skip VAE compilation - focus on keeping text encoder working
-        self._log_timing("Skipping VAE compilation (keeping original working setup)")
+        # Skip VAE compilation entirely (focus on text encoder + FP8 quantization)
+        self._log_timing("Skipping VAE compilation (avoiding compilation complexity)")
         self.vae._compiled_decode = self.vae.decode_to_pixel
         self._vae_compiled = False
             
