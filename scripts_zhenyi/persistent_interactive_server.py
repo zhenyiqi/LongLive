@@ -304,46 +304,57 @@ class PersistentInteractivePipeline:
         print("MODEL QUANTIZATION STATUS DEBUG")
         print("="*60)
         
-        # Check for quantized modules (improved detection for dynamic quantization)
-        quantized_modules = []
-        dynamic_quantized_modules = []
+        # Check quantization status for all models
+        models_to_check = [
+            ("VAE", self.pipeline.vae),
+            ("Text Encoder", self.pipeline.text_encoder),
+            ("Generator", self.pipeline.generator)
+        ]
         
-        for name, module in self.pipeline.vae.named_modules():
-            # Check for static quantization
-            if 'quantized' in str(type(module)).lower() or hasattr(module, '_packed_params'):
-                quantized_modules.append((name, type(module).__name__))
-            # Check for dynamic quantization indicators
-            elif hasattr(module, '_observer') or hasattr(module, 'observer'):
-                dynamic_quantized_modules.append((name, type(module).__name__))
-        
-        # Check if the entire model was wrapped by quantize_dynamic
-        model_is_quantized = (
-            'DynamicQuantizedModule' in str(type(self.pipeline.vae)) or
-            hasattr(self.pipeline.vae, '_original_module') or
-            'ScriptModule' in str(type(self.pipeline.vae))
-        )
-                
-        total_quantized = len(quantized_modules) + len(dynamic_quantized_modules)
-        
-        if total_quantized > 0 or model_is_quantized:
-            print(f"✅ Quantization detected:")
-            if len(quantized_modules) > 0:
-                print(f"  Static quantized modules: {len(quantized_modules)}")
-            if len(dynamic_quantized_modules) > 0:
-                print(f"  Dynamic quantized modules: {len(dynamic_quantized_modules)}")
-            if model_is_quantized:
-                print(f"  Model wrapper: {type(self.pipeline.vae).__name__}")
-        else:
-            print("❌ No quantized modules detected")
-            print("   Note: Dynamic quantization may not show in module inspection")
+        for model_name, model in models_to_check:
+            print(f"\n{model_name}:")
+            print(f"  Model type: {type(model).__name__}")
             
-        # For dynamic quantization, weights stay in original dtype but modules are wrapped
-        print(f"\nVAE model type: {type(self.pipeline.vae).__name__}")
-        
-        # Show a few parameter dtypes for reference
-        print(f"\nSample parameter dtypes (may stay original for dynamic quantization):")
-        for name, param in list(self.pipeline.vae.named_parameters())[:3]:  # First 3 only
-            print(f"  {name}: {param.dtype}")
+            # Check for quantized modules
+            quantized_modules = []
+            dynamic_quantized_modules = []
+            
+            for name, module in model.named_modules():
+                # Check for static quantization
+                if 'quantized' in str(type(module)).lower() or hasattr(module, '_packed_params'):
+                    quantized_modules.append((name, type(module).__name__))
+                # Check for dynamic quantization indicators
+                elif hasattr(module, '_observer') or hasattr(module, 'observer'):
+                    dynamic_quantized_modules.append((name, type(module).__name__))
+            
+            # Check if the entire model was wrapped by quantize_dynamic
+            model_is_quantized = (
+                'DynamicQuantizedModule' in str(type(model)) or
+                hasattr(model, '_original_module') or
+                'ScriptModule' in str(type(model))
+            )
+                    
+            total_quantized = len(quantized_modules) + len(dynamic_quantized_modules)
+            
+            if total_quantized > 0 or model_is_quantized:
+                print(f"  ✅ Quantization detected:")
+                if len(quantized_modules) > 0:
+                    print(f"    Static quantized modules: {len(quantized_modules)}")
+                if len(dynamic_quantized_modules) > 0:
+                    print(f"    Dynamic quantized modules: {len(dynamic_quantized_modules)}")
+                if model_is_quantized:
+                    print(f"    Model wrapped for quantization")
+            else:
+                print(f"  ❌ No quantized modules detected")
+            
+            # Show a few parameter dtypes for reference
+            param_count = 0
+            for name, param in model.named_parameters():
+                if param_count < 3:  # Show first 3 parameters
+                    print(f"    {name}: {param.dtype}")
+                param_count += 1
+                if param_count >= 3:
+                    break
             
         print("="*60)
         

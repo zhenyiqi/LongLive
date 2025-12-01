@@ -42,6 +42,6 @@ quantization:
   enabled: true               # Enable quantization
   dtype: "int8"              # INT8 quantization (much more stable than FP8)
   method: "dynamic"          # Quantization method: "dynamic" (post-training) or "static" (needs calibration)
-  models: ["vae"]             # Which models to quantize: ["generator", "text_encoder", "vae"]
+  models: ["generator", "text_encoder", "vae"]  # Quantize all models for maximum speedup
   preserve_lora: true         # Skip LoRA parameters when quantizing generator
   timing: true                # Track quantization timing in latency tracker

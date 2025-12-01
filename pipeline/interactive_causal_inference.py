@@ -73,68 +73,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             self.generator.latency_tracker = tracker  
             self.vae.latency_tracker = tracker
             
-    def _compile_models_for_h100(self):
-        """Compile major models for H100 optimization"""
-        
-        # Compile text encoder
-        if not hasattr(self, '_text_encoder_compiled'):
-            compilation_start = time.perf_counter()
-            self._log_timing("Compiling text encoder for H100...")
-            try:
-                self.text_encoder._compiled_forward = torch.compile(
-                    self.text_encoder.__call__,
-                    mode="reduce-overhead",
-                    dynamic=False,
-                    fullgraph=False
-                )
-                self._text_encoder_compiled = True
-                compilation_time = (time.perf_counter() - compilation_start) * 1000
-                self._log_timing(f"Text encoder compilation successful", compilation_time)
-            except Exception as e:
-                compilation_time = (time.perf_counter() - compilation_start) * 1000
-                self._log_timing(f"Text encoder compilation failed: {e}", compilation_time)
-                self.text_encoder._compiled_forward = self.text_encoder.__call__
-                self._text_encoder_compiled = False
-        
-        # Compile generator/diffusion model
-        if not hasattr(self, '_generator_compiled'):
-            compilation_start = time.perf_counter()
-            self._log_timing("Compiling generator for H100...")
-            try:
-                self.generator._compiled_forward = torch.compile(
-                    self.generator.__call__,
-                    mode="reduce-overhead", 
-                    dynamic=False,
-                    fullgraph=False
-                )
-                self._generator_compiled = True
-                compilation_time = (time.perf_counter() - compilation_start) * 1000
-                self._log_timing(f"Generator compilation successful", compilation_time)
-            except Exception as e:
-                compilation_time = (time.perf_counter() - compilation_start) * 1000
-                self._log_timing(f"Generator compilation failed: {e}", compilation_time)
-                self.generator._compiled_forward = self.generator.__call__
-                self._generator_compiled = False
-        
-        # Compile VAE decoder
-        if not hasattr(self, '_vae_compiled'):
-            compilation_start = time.perf_counter()
-            self._log_timing("Compiling VAE decoder for H100...")
-            try:
-                self.vae._compiled_decode = torch.compile(
-                    self.vae.decode_to_pixel,
-                    mode="reduce-overhead",
-                    dynamic=False,
-                    fullgraph=False
-                )
-                self._vae_compiled = True
-                compilation_time = (time.perf_counter() - compilation_start) * 1000
-                self._log_timing(f"VAE decoder compilation successful", compilation_time)
-            except Exception as e:
-                compilation_time = (time.perf_counter() - compilation_start) * 1000
-                self._log_timing(f"VAE compilation failed: {e}, using original decoder", compilation_time)
-                self.vae._compiled_decode = self.vae.decode_to_pixel
-                self._vae_compiled = False
+    # (Removed obsolete _compile_models_for_h100; using _compile_safe_models_for_h100 instead)
     
     def _get_block_mask(self, device, num_frames: int, local_attn_size: int | None = None):
         """
@@ -156,21 +95,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             self._block_mask_cache[key] = mask
         return mask
     
-    def _setup_uncompiled_models(self):
-        """Setup models without compilation (fallback for CUDA Graphs issues)"""
-        self._log_timing("Setting up models without compilation (avoiding CUDA Graphs issues)")
-        
-        # Set up uncompiled forwards as direct references
-        self._text_encoder_compiled = False
-        self.text_encoder._compiled_forward = self.text_encoder.__call__
-        
-        self._generator_compiled = False  
-        self.generator._compiled_forward = self.generator.__call__
-        
-        self._vae_compiled = False
-        self.vae._compiled_decode = self.vae.decode_to_pixel
-        
-        self._log_timing("Models ready (uncompiled)")
+    # (Removed unused _setup_uncompiled_models helper)
     
     def _compile_safe_models_for_h100(self):
         """Compile only text encoder and VAE (avoid generator CUDA Graphs issues)"""
@@ -637,6 +562,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             with time_device_sync(latency_tracker, "interactive_context_prep"):
                 context_timestep = torch.ones_like(timestep) * self.args.context_noise
                 
+            # (167ms)
             with time_kv_operations(latency_tracker, "interactive_kv_cache_update", 
                                   block_idx=block_idx, 
                                   segment_idx=segment_idx,
@@ -708,32 +634,22 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         # VAE preparation
         self._log_timing("Starting VAE decode...")
         
+        # (<0.1ms)
         with time_device_sync(latency_tracker, "interactive_vae_input_prep"):
             output_for_vae = output.to(noise.device)
             
         # VAE decode timing - ONLY the actual decode operation (models already compiled)
         vae_decode_start = time.perf_counter()
         
-        # Use compiled decoder
-        try:
-            if latency_tracker and COMPREHENSIVE_TIMING_AVAILABLE:
-                with latency_tracker.time_component('interactive_vae_decode_compiled', 
-                                                  num_frames=num_output_frames,
-                                                  input_shape=list(output.shape),
-                                                  compiled=self._vae_compiled):
-                    video = self.vae._compiled_decode(output_for_vae, use_cache=False)
-            else:
-                video = self.vae._compiled_decode(output_for_vae, use_cache=False)
-        except Exception as e:
-            # Fallback to original decoder if compiled version fails
-            self._log_timing(f"Compiled decoder failed: {e}, using original")
-            if latency_tracker and COMPREHENSIVE_TIMING_AVAILABLE:
-                with latency_tracker.time_component('interactive_vae_decode_fallback', 
-                                                  num_frames=num_output_frames,
-                                                  input_shape=list(output.shape)):
-                    video = self.vae.decode_to_pixel(output_for_vae, use_cache=False)
-            else:
+        # VAE decode (non-compiled)
+        if latency_tracker and COMPREHENSIVE_TIMING_AVAILABLE:
+            with latency_tracker.time_component('interactive_vae_decode', 
+                                              num_frames=num_output_frames,
+                                              input_shape=list(output.shape),
+                                              compiled=False):
                 video = self.vae.decode_to_pixel(output_for_vae, use_cache=False)
+        else:
+            video = self.vae.decode_to_pixel(output_for_vae, use_cache=False)
         
         # End VAE decode timing - pure decode time only
         vae_decode_time = (time.perf_counter() - vae_decode_start) * 1000
