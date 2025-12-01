@@ -168,89 +168,66 @@ class PersistentInteractivePipeline:
             raise RuntimeError(f"Unsupported quantization dtype: {quant_dtype}")
             
     def _apply_int8_quantization(self, models_to_quantize: list, method: str):
-        """Apply INT8 quantization using PyTorch's quantization APIs"""
-        import torch.quantization as quant
-            
+        """Apply GPU-compatible INT8 quantization"""
+        
+        # Only try torchao for GPU-compatible quantization
         try:
+            import torchao
+            print("Using torchao for GPU-compatible quantization...")
+            if self._apply_torchao_quantization(models_to_quantize, method):
+                return  # Success, done
+            print("torchao quantization failed")
+            raise RuntimeError("torchao quantization failed")
+        except ImportError:
+            print("ERROR: torchao not available. PyTorch's quantization only works on CPU.")
+            print("For GPU quantization, please install torchao:")
+            print("  pip install torchao")
+            raise RuntimeError("GPU quantization requires torchao - PyTorch quantization is CPU-only")
+    
+    def _apply_torchao_quantization(self, models_to_quantize: list, method: str):
+        """Apply GPU-compatible quantization using torchao"""
+        from torchao.quantization import quantize_
+        
+        try:
+            # Use int8 dynamic quantization that works on GPU
+            from torchao.quantization import int8_dynamic_activation_int8_weight
+            
             # Quantize VAE if requested
             if "vae" in models_to_quantize:
-                print("Quantizing VAE to INT8...")
+                print("Quantizing VAE with torchao INT8...")
                 quant_start = time.perf_counter()
                 
-                if method == "dynamic":
-                    # Dynamic quantization (no calibration needed)
-                    self.pipeline.vae = quant.quantize_dynamic(
-                        self.pipeline.vae, 
-                        {torch.nn.Conv2d, torch.nn.Conv3d, torch.nn.Linear}, 
-                        dtype=torch.qint8
-                    )
-                else:
-                    print(f"Static quantization method '{method}' not implemented yet")
-                    print("Using dynamic quantization instead")
-                    self.pipeline.vae = quant.quantize_dynamic(
-                        self.pipeline.vae, 
-                        {torch.nn.Conv2d, torch.nn.Conv3d, torch.nn.Linear}, 
-                        dtype=torch.qint8
-                    )
+                quantize_(self.pipeline.vae, int8_dynamic_activation_int8_weight())
                 
                 quant_time = (time.perf_counter() - quant_start) * 1000
                 print(f"VAE quantization completed: {quant_time:.2f} ms")
-                print(f"  - Quantized Conv2d, Conv3d, and Linear layers to INT8")
-                print(f"  - VAE model type after quantization: {type(self.pipeline.vae).__name__}")
                 
-                # Quick verification: check if any modules have dynamic quantization
-                quantized_count = 0
-                for name, module in self.pipeline.vae.named_modules():
-                    if isinstance(module, (torch.nn.quantized.dynamic.Linear, 
-                                         torch.nn.quantized.dynamic.Conv2d,
-                                         torch.nn.quantized.dynamic.Conv3d)):
-                        quantized_count += 1
-                
-                if quantized_count > 0:
-                    print(f"  - Verified: {quantized_count} modules are now dynamically quantized")
-                else:
-                    print(f"  - Note: Dynamic quantization may not change module types visible in inspection")
-                
-            # Quantize text encoder if requested  
+            # Quantize text encoder if requested
             if "text_encoder" in models_to_quantize:
-                print("Quantizing text encoder to INT8...")
+                print("Quantizing text encoder with torchao INT8...")
                 quant_start = time.perf_counter()
                 
-                # Skip Embedding layers as they need special float_qparams config
-                try:
-                    self.pipeline.text_encoder = quant.quantize_dynamic(
-                        self.pipeline.text_encoder,
-                        {torch.nn.Linear},  # Only Linear layers, skip Embedding
-                        dtype=torch.qint8
-                    )
-                    quant_time = (time.perf_counter() - quant_start) * 1000
-                    print(f"Text encoder quantization completed: {quant_time:.2f} ms")
-                    print(f"  - Quantized Linear layers only (Embedding layers skipped)")
-                except Exception as e:
-                    print(f"Text encoder quantization failed: {e}")
-                    print("Continuing without text encoder quantization...")
-            
+                quantize_(self.pipeline.text_encoder, int8_dynamic_activation_int8_weight())
+                
+                quant_time = (time.perf_counter() - quant_start) * 1000
+                print(f"Text encoder quantization completed: {quant_time:.2f} ms")
+                
             # Quantize generator if requested
             if "generator" in models_to_quantize:
-                print("Quantizing generator to INT8...")
+                print("Quantizing generator with torchao INT8...")
                 quant_start = time.perf_counter()
                 
-                # Note: Be careful with LoRA + quantization
-                if hasattr(self.pipeline, 'is_lora_enabled') and self.pipeline.is_lora_enabled:
-                    print("Warning: Quantizing generator with LoRA may affect adapter performance")
+                quantize_(self.pipeline.generator, int8_dynamic_activation_int8_weight())
                 
-                self.pipeline.generator = quant.quantize_dynamic(
-                    self.pipeline.generator,
-                    {torch.nn.Conv2d, torch.nn.Conv3d, torch.nn.Linear},
-                    dtype=torch.qint8
-                )
-                        
                 quant_time = (time.perf_counter() - quant_start) * 1000
                 print(f"Generator quantization completed: {quant_time:.2f} ms")
                 
         except Exception as e:
-            print(f"INT8 quantization failed: {e}")
-            raise RuntimeError(f"Quantization failed: {e}") from e
+            print(f"torchao quantization failed: {e}")
+            print("Falling back to disabling quantization...")
+            return False  # Signal fallback needed
+            
+        return True  # Success
             
     def _manual_fp8_conversion(self, model: torch.nn.Module, target_dtype: torch.dtype):
         """Manual FP8 conversion ensuring all tensors have consistent dtype"""
