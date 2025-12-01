@@ -84,7 +84,12 @@ class PersistentInteractivePipeline:
         
         # Apply quantization AFTER moving to device
         if getattr(self.config, "quantization", None) and self.config.quantization.get("enabled", False):
+            print(f"[DEBUG] Quantization config found: {self.config.quantization}")
             self._apply_quantization()
+        else:
+            print(f"[DEBUG] No quantization config or disabled. Has quantization attr: {hasattr(self.config, 'quantization')}")
+            if hasattr(self.config, 'quantization'):
+                print(f"[DEBUG] Quantization config: {self.config.quantization}")
         
         # Debug: Print model dtypes if quantization was attempted
         if getattr(self.config, "quantization", None) and self.config.quantization.get("enabled", False):
@@ -96,7 +101,8 @@ class PersistentInteractivePipeline:
         print("NOTE: First inference will include compilation time (~30s).")
         print("Subsequent inferences will be much faster (~60s vs ~90s)!")
         if getattr(self.config, "quantization", None) and self.config.quantization.get("enabled", False):
-            print("FP8 quantization enabled - expect additional ~20% speedup!")
+            quant_type = self.config.quantization.get("dtype", "unknown")
+            print(f"{quant_type.upper()} quantization enabled - expect additional speedup!")
         print("="*60)
         
     def _load_generator_weights(self):
