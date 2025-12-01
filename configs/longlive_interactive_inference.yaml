@@ -37,11 +37,3 @@ adapter:
   dtype: "bfloat16"          # Data type for LoRA parameters: "bfloat16", "float16", "float32"
   verbose: false              # Whether to print all target module names
 
-# INT8 Quantization (mature and stable)
-quantization:
-  enabled: true               # Enable quantization
-  dtype: "int8"              # INT8 quantization (much more stable than FP8)
-  method: "dynamic"          # Quantization method: "dynamic" (post-training) or "static" (needs calibration)
-  models: ["vae"]             # Only quantize VAE for now (GPU compatibility issues with others)
-  preserve_lora: true         # Skip LoRA parameters when quantizing generator
-  timing: true                # Track quantization timing in latency trstatr

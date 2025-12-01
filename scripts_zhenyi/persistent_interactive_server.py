@@ -39,24 +39,6 @@ class PersistentInteractivePipeline:
         # Load config
         self.config = OmegaConf.load(config_path)
         
-        # Override quantization config with CLI args if provided
-        if cli_args:
-            # Check both new and legacy flags
-            enable_quant = cli_args.quantize or cli_args.fp8
-            disable_quant = cli_args.no_quantize or cli_args.no_fp8
-            
-            if enable_quant:
-                if not hasattr(self.config, 'quantization'):
-                    self.config.quantization = {}
-                self.config.quantization.enabled = True
-                flag_used = "--quantize" if cli_args.quantize else "--fp8"
-                print(f"Quantization enabled via {flag_used} flag")
-            elif disable_quant:
-                if hasattr(self.config, 'quantization'):
-                    self.config.quantization.enabled = False
-                flag_used = "--no-quantize" if cli_args.no_quantize else "--no-fp8"
-                print(f"Quantization disabled via {flag_used} flag")
-        
         # Setup device
         if "LOCAL_RANK" in os.environ:
             self.local_rank = int(os.environ["LOCAL_RANK"])
@@ -88,27 +70,11 @@ class PersistentInteractivePipeline:
         self.pipeline.generator.to(device=self.device)
         self.pipeline.vae.to(device=self.device)
         
-        # Apply quantization AFTER moving to device
-        if getattr(self.config, "quantization", None) and self.config.quantization.get("enabled", False):
-            print(f"[DEBUG] Quantization config found: {self.config.quantization}")
-            self._apply_quantization()
-        else:
-            print(f"[DEBUG] No quantization config or disabled. Has quantization attr: {hasattr(self.config, 'quantization')}")
-            if hasattr(self.config, 'quantization'):
-                print(f"[DEBUG] Quantization config: {self.config.quantization}")
-        
-        # Debug: Print model dtypes if quantization was attempted
-        if getattr(self.config, "quantization", None) and self.config.quantization.get("enabled", False):
-            self._print_model_dtypes()
-        
         init_time = (time.perf_counter() - init_start) * 1000
         print(f"Pipeline initialization completed: {init_time:.2f} ms")
         print("="*60)
         print("NOTE: First inference will include compilation time (~30s).")
         print("Subsequent inferences will be much faster (~60s vs ~90s)!")
-        if getattr(self.config, "quantization", None) and self.config.quantization.get("enabled", False):
-            quant_type = self.config.quantization.get("dtype", "unknown")
-            print(f"{quant_type.upper()} quantization enabled - expect additional speedup!")
         print("="*60)
         
     def _load_generator_weights(self):
@@ -149,196 +115,6 @@ class PersistentInteractivePipeline:
             
         self.pipeline.is_lora_enabled = True
         
-    def _apply_quantization(self):
-        """Apply INT8 quantization to specified models"""
-        quant_config = self.config.quantization
-        quant_dtype = quant_config.get("dtype", "int8")
-        quant_method = quant_config.get("method", "dynamic")
-        models_to_quantize = quant_config.get("models", [])
-        
-        print(f"Applying {quant_dtype} quantization (method: {quant_method}) to models: {models_to_quantize}")
-        
-        if quant_dtype == "int8":
-            self._apply_int8_quantization(models_to_quantize, quant_method)
-        elif quant_dtype in ["float8_e4m3fn", "float8_e5m2"]:
-            print("Warning: FP8 quantization not implemented in this version")
-            print("Use dtype: 'int8' for stable quantization")
-            raise RuntimeError("FP8 quantization not supported - use INT8")
-        else:
-            raise RuntimeError(f"Unsupported quantization dtype: {quant_dtype}")
-            
-    def _apply_int8_quantization(self, models_to_quantize: list, method: str):
-        """Apply GPU-compatible INT8 quantization"""
-        
-        # Only try torchao for GPU-compatible quantization
-        try:
-            import torchao
-            print("Using torchao for GPU-compatible quantization...")
-            if self._apply_torchao_quantization(models_to_quantize, method):
-                return  # Success, done
-            print("torchao quantization failed")
-            raise RuntimeError("torchao quantization failed")
-        except ImportError:
-            print("ERROR: torchao not available. PyTorch's quantization only works on CPU.")
-            print("For GPU quantization, please install torchao:")
-            print("  pip install torchao")
-            raise RuntimeError("GPU quantization requires torchao - PyTorch quantization is CPU-only")
-    
-    def _apply_torchao_quantization(self, models_to_quantize: list, method: str):
-        """Apply GPU-compatible quantization using torchao"""
-        from torchao.quantization import quantize_
-        
-        try:
-            # Use int8 dynamic quantization that works on GPU
-            from torchao.quantization import int8_dynamic_activation_int8_weight
-            
-            # Quantize VAE if requested
-            if "vae" in models_to_quantize:
-                print("Quantizing VAE with torchao INT8...")
-                quant_start = time.perf_counter()
-                
-                quantize_(self.pipeline.vae, int8_dynamic_activation_int8_weight())
-                
-                quant_time = (time.perf_counter() - quant_start) * 1000
-                print(f"VAE quantization completed: {quant_time:.2f} ms")
-                
-            # Quantize text encoder if requested
-            if "text_encoder" in models_to_quantize:
-                print("Quantizing text encoder with torchao INT8...")
-                quant_start = time.perf_counter()
-                
-                quantize_(self.pipeline.text_encoder, int8_dynamic_activation_int8_weight())
-                
-                quant_time = (time.perf_counter() - quant_start) * 1000
-                print(f"Text encoder quantization completed: {quant_time:.2f} ms")
-                
-            # Quantize generator if requested
-            if "generator" in models_to_quantize:
-                print("Quantizing generator with torchao INT8...")
-                quant_start = time.perf_counter()
-                
-                quantize_(self.pipeline.generator, int8_dynamic_activation_int8_weight())
-                
-                quant_time = (time.perf_counter() - quant_start) * 1000
-                print(f"Generator quantization completed: {quant_time:.2f} ms")
-                
-        except Exception as e:
-            print(f"torchao quantization failed: {e}")
-            print("Falling back to disabling quantization...")
-            return False  # Signal fallback needed
-            
-        return True  # Success
-            
-    def _manual_fp8_conversion(self, model: torch.nn.Module, target_dtype: torch.dtype):
-        """Manual FP8 conversion ensuring all tensors have consistent dtype"""
-        total_params = 0
-        quantized_params = 0
-        total_buffers = 0 
-        quantized_buffers = 0
-        
-        # Convert all parameters
-        for name, param in model.named_parameters():
-            total_params += 1
-            if param.dtype in (torch.bfloat16, torch.float32, torch.float16):
-                param.data = param.data.to(target_dtype)
-                quantized_params += 1
-                
-        # Convert all buffers (including mean/std we registered)
-        for name, buffer in model.named_buffers():
-            total_buffers += 1
-            if buffer.dtype in (torch.bfloat16, torch.float32, torch.float16):
-                buffer.data = buffer.data.to(target_dtype)
-                quantized_buffers += 1
-                
-        print(f"  - Quantized {quantized_params}/{total_params} parameters")
-        print(f"  - Quantized {quantized_buffers}/{total_buffers} buffers")
-        
-    def _validate_quantization(self, model_name: str, model: torch.nn.Module, target_dtype: torch.dtype):
-        """Validate that quantization was applied correctly"""
-        fp8_params = 0
-        total_params = 0
-        fp8_buffers = 0
-        total_buffers = 0
-        
-        # Check parameters
-        for name, param in model.named_parameters():
-            total_params += 1
-            if param.dtype == target_dtype:
-                fp8_params += 1
-                
-        # Check buffers  
-        for name, buffer in model.named_buffers():
-            total_buffers += 1
-            if buffer.dtype == target_dtype:
-                fp8_buffers += 1
-                
-        print(f"  - Validation: {fp8_params}/{total_params} parameters in FP8")
-        print(f"  - Validation: {fp8_buffers}/{total_buffers} buffers in FP8")
-        
-        if fp8_params == 0 and fp8_buffers == 0:
-            print(f"  ⚠️  WARNING: No {model_name} tensors were quantized to FP8!")
-        else:
-            print(f"  ✅ {model_name} quantization successful")
-            
-    def _print_model_dtypes(self):
-        """Debug function to print model data types and quantization status"""
-        print("\n" + "="*60)
-        print("MODEL QUANTIZATION STATUS DEBUG")
-        print("="*60)
-        
-        # Check quantization status for all models
-        models_to_check = [
-            ("VAE", self.pipeline.vae),
-            ("Text Encoder", self.pipeline.text_encoder),
-            ("Generator", self.pipeline.generator)
-        ]
-        
-        for model_name, model in models_to_check:
-            print(f"\n{model_name}:")
-            print(f"  Model type: {type(model).__name__}")
-            
-            # Check for quantized modules
-            quantized_modules = []
-            dynamic_quantized_modules = []
-            
-            for name, module in model.named_modules():
-                # Check for static quantization
-                if 'quantized' in str(type(module)).lower() or hasattr(module, '_packed_params'):
-                    quantized_modules.append((name, type(module).__name__))
-                # Check for dynamic quantization indicators
-                elif hasattr(module, '_observer') or hasattr(module, 'observer'):
-                    dynamic_quantized_modules.append((name, type(module).__name__))
-            
-            # Check if the entire model was wrapped by quantize_dynamic
-            model_is_quantized = (
-                'DynamicQuantizedModule' in str(type(model)) or
-                hasattr(model, '_original_module') or
-                'ScriptModule' in str(type(model))
-            )
-                    
-            total_quantized = len(quantized_modules) + len(dynamic_quantized_modules)
-            
-            if total_quantized > 0 or model_is_quantized:
-                print(f"  ✅ Quantization detected:")
-                if len(quantized_modules) > 0:
-                    print(f"    Static quantized modules: {len(quantized_modules)}")
-                if len(dynamic_quantized_modules) > 0:
-                    print(f"    Dynamic quantized modules: {len(dynamic_quantized_modules)}")
-                if model_is_quantized:
-                    print(f"    Model wrapped for quantization")
-            else:
-                print(f"  ❌ No quantized modules detected")
-            
-            # Show a few parameter dtypes for reference
-            param_count = 0
-            for name, param in model.named_parameters():
-                if param_count < 3:  # Show first 3 parameters
-                    print(f"    {name}: {param.dtype}")
-                param_count += 1
-                if param_count >= 3:
-                    break
-            
-        print("="*60)
         
     def run_inference(self, prompts_list: List[List[str]], switch_frame_indices: List[int], 
                      output_path: str = None, enable_timing: bool = True):
@@ -484,15 +260,6 @@ def main():
                        help="Run inference on data file and exit")
     parser.add_argument("--output_dir", type=str, default="/tmp/persistent_outputs",
                        help="Output directory for videos")
-    parser.add_argument("--quantize", action="store_true",
-                       help="Enable quantization (overrides config)")
-    parser.add_argument("--no-quantize", action="store_true",
-                       help="Disable quantization (overrides config)")
-    # Legacy flags for backward compatibility
-    parser.add_argument("--fp8", action="store_true",
-                       help="Enable quantization (legacy flag)")
-    parser.add_argument("--no-fp8", action="store_true",
-                       help="Disable quantization (legacy flag)")
     args = parser.parse_args()
     
     # Initialize persistent pipeline
