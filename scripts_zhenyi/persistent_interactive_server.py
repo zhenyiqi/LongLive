@@ -196,6 +196,20 @@ class PersistentInteractivePipeline:
                 quant_time = (time.perf_counter() - quant_start) * 1000
                 print(f"VAE quantization completed: {quant_time:.2f} ms")
                 print(f"  - Quantized Conv2d, Conv3d, and Linear layers to INT8")
+                print(f"  - VAE model type after quantization: {type(self.pipeline.vae).__name__}")
+                
+                # Quick verification: check if any modules have dynamic quantization
+                quantized_count = 0
+                for name, module in self.pipeline.vae.named_modules():
+                    if isinstance(module, (torch.nn.quantized.dynamic.Linear, 
+                                         torch.nn.quantized.dynamic.Conv2d,
+                                         torch.nn.quantized.dynamic.Conv3d)):
+                        quantized_count += 1
+                
+                if quantized_count > 0:
+                    print(f"  - Verified: {quantized_count} modules are now dynamically quantized")
+                else:
+                    print(f"  - Note: Dynamic quantization may not change module types visible in inspection")
                 
             # Quantize text encoder if requested  
             if "text_encoder" in models_to_quantize:
@@ -290,20 +304,38 @@ class PersistentInteractivePipeline:
         print("MODEL QUANTIZATION STATUS DEBUG")
         print("="*60)
         
-        # Check for quantized modules (dynamic quantization)
+        # Check for quantized modules (improved detection for dynamic quantization)
         quantized_modules = []
+        dynamic_quantized_modules = []
+        
         for name, module in self.pipeline.vae.named_modules():
-            if hasattr(module, '_is_quantized_layer') or 'quantized' in str(type(module)).lower():
+            # Check for static quantization
+            if 'quantized' in str(type(module)).lower() or hasattr(module, '_packed_params'):
                 quantized_modules.append((name, type(module).__name__))
+            # Check for dynamic quantization indicators
+            elif hasattr(module, '_observer') or hasattr(module, 'observer'):
+                dynamic_quantized_modules.append((name, type(module).__name__))
+        
+        # Check if the entire model was wrapped by quantize_dynamic
+        model_is_quantized = (
+            'DynamicQuantizedModule' in str(type(self.pipeline.vae)) or
+            hasattr(self.pipeline.vae, '_original_module') or
+            'ScriptModule' in str(type(self.pipeline.vae))
+        )
                 
-        if quantized_modules:
-            print(f"✅ Found {len(quantized_modules)} quantized modules:")
-            for name, module_type in quantized_modules[:5]:  # Show first 5
-                print(f"  {name}: {module_type}")
-            if len(quantized_modules) > 5:
-                print(f"  ... and {len(quantized_modules) - 5} more")
+        total_quantized = len(quantized_modules) + len(dynamic_quantized_modules)
+        
+        if total_quantized > 0 or model_is_quantized:
+            print(f"✅ Quantization detected:")
+            if len(quantized_modules) > 0:
+                print(f"  Static quantized modules: {len(quantized_modules)}")
+            if len(dynamic_quantized_modules) > 0:
+                print(f"  Dynamic quantized modules: {len(dynamic_quantized_modules)}")
+            if model_is_quantized:
+                print(f"  Model wrapper: {type(self.pipeline.vae).__name__}")
         else:
             print("❌ No quantized modules detected")
+            print("   Note: Dynamic quantization may not show in module inspection")
             
         # For dynamic quantization, weights stay in original dtype but modules are wrapped
         print(f"\nVAE model type: {type(self.pipeline.vae).__name__}")

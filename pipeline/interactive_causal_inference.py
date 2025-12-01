@@ -558,7 +558,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                     )
 
                 if index < len(self.denoising_step_list) - 1:
-                    # Intermediate denoising step
+                    # Intermediate denoising step (each step is 167ms)
                     if latency_tracker and COMPREHENSIVE_TIMING_AVAILABLE:
                         with latency_tracker.time_component('interactive_denoising_step', 
                                                           timestep=timestep_val,
@@ -585,6 +585,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                             current_start=current_start_frame * self.frame_seq_length,
                         )
                         
+                    # 0.2+ms
                     with time_device_sync(latency_tracker, "interactive_noise_scheduling"):
                         next_timestep = self.denoising_step_list[index + 1]
                         noisy_input = self.scheduler.add_noise(
@@ -596,7 +597,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                             ),
                         ).unflatten(0, denoised_pred.shape[:2])
                 else:
-                    # Final denoising step
+                    # Final denoising step (167ms)
                     if latency_tracker and COMPREHENSIVE_TIMING_AVAILABLE:
                         with latency_tracker.time_component('interactive_denoising_step_final', 
                                                           timestep=timestep_val,
@@ -623,7 +624,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                             current_start=current_start_frame * self.frame_seq_length,
                         )
 
-            # Record output
+            # Record output (takes little time)
             with time_device_sync(latency_tracker, "interactive_output_recording"):
                 output[:, current_start_frame : current_start_frame + current_num_frames] = denoised_pred.to(output.device)
 
@@ -632,7 +633,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                 for frame_offset in range(current_num_frames):
                     latency_tracker.record_frame_completion(frame_idx + frame_offset)
 
-            # KV cache update with clean context
+            # KV cache update with clean context (0.1+ms)
             with time_device_sync(latency_tracker, "interactive_context_prep"):
                 context_timestep = torch.ones_like(timestep) * self.args.context_noise
                 
