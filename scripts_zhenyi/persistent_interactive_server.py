@@ -285,19 +285,33 @@ class PersistentInteractivePipeline:
             print(f"  ✅ {model_name} quantization successful")
             
     def _print_model_dtypes(self):
-        """Debug function to print model data types"""
+        """Debug function to print model data types and quantization status"""
         print("\n" + "="*60)
-        print("MODEL DATA TYPES DEBUG")
+        print("MODEL QUANTIZATION STATUS DEBUG")
         print("="*60)
         
-        print(f"VAE parameter dtypes:")
-        for name, param in list(self.pipeline.vae.named_parameters())[:5]:  # First 5 only
-            print(f"  {name}: {param.dtype}")
-        print(f"  ... and {len(list(self.pipeline.vae.named_parameters())) - 5} more")
+        # Check for quantized modules (dynamic quantization)
+        quantized_modules = []
+        for name, module in self.pipeline.vae.named_modules():
+            if hasattr(module, '_is_quantized_layer') or 'quantized' in str(type(module)).lower():
+                quantized_modules.append((name, type(module).__name__))
+                
+        if quantized_modules:
+            print(f"✅ Found {len(quantized_modules)} quantized modules:")
+            for name, module_type in quantized_modules[:5]:  # Show first 5
+                print(f"  {name}: {module_type}")
+            if len(quantized_modules) > 5:
+                print(f"  ... and {len(quantized_modules) - 5} more")
+        else:
+            print("❌ No quantized modules detected")
+            
+        # For dynamic quantization, weights stay in original dtype but modules are wrapped
+        print(f"\nVAE model type: {type(self.pipeline.vae).__name__}")
         
-        print(f"\nVAE buffer dtypes:")
-        for name, buffer in self.pipeline.vae.named_buffers():
-            print(f"  {name}: {buffer.dtype}")
+        # Show a few parameter dtypes for reference
+        print(f"\nSample parameter dtypes (may stay original for dynamic quantization):")
+        for name, param in list(self.pipeline.vae.named_parameters())[:3]:  # First 3 only
+            print(f"  {name}: {param.dtype}")
             
         print("="*60)
         
