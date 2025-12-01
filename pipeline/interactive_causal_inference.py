@@ -52,6 +52,9 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         self.global_sink = getattr(args, "global_sink", False)
         # Cache for blockwise causal attention masks keyed by (device, num_frames, frame_seqlen, num_frame_per_block, local_attn_size)
         self._block_mask_cache = {}
+        # Prefetch structures for overlapping recache preparation with compute
+        self._prefetch_stream = torch.cuda.Stream(device=device) if torch.cuda.is_available() else None
+        self._prefetch_cache = None
         
         # Initialize latency tracking
         self.latency_tracker = None
@@ -273,14 +276,35 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         
         with time_attention_kernel(self.latency_tracker, operation="prompt_switch_mask_prep",
                                  segment_idx=segment_idx, num_frames=num_recache_frames):
-            block_mask = self._get_block_mask(
-                device=device,
-                num_frames=num_recache_frames,
-                local_attn_size=self.local_attn_size
-            )
+            # Use prefetched mask/frames if available and matching this recache request
+            use_prefetch = False
+            if (self._prefetch_cache is not None 
+                and self._prefetch_cache.get("start_frame", -1) == recache_start_frame
+                and self._prefetch_cache.get("num_frames", -1) == num_recache_frames):
+                try:
+                    cur_stream = torch.cuda.current_stream(device=device)
+                    cur_stream.wait_stream(self._prefetch_stream)  # ensure prefetch finished
+                    frames_to_recache = self._prefetch_cache["frames"]
+                    block_mask = self._prefetch_cache["mask"]
+                    context_timestep = self._prefetch_cache["context_timestep"]
+                    use_prefetch = True
+                except Exception:
+                    use_prefetch = False
+            if not use_prefetch:
+                block_mask = self._get_block_mask(
+                    device=device,
+                    num_frames=num_recache_frames,
+                    local_attn_size=self.local_attn_size
+                )
         
         context_timestep = torch.ones([batch_size, num_recache_frames], 
                                     device=device, dtype=torch.int64) * self.args.context_noise
+        if use_prefetch:
+            # Use the prefetched context_timestep if present
+            try:
+                context_timestep = context_timestep if "context_timestep" not in self._prefetch_cache else self._prefetch_cache["context_timestep"]
+            except Exception:
+                pass
         
         self.generator.model.block_mask = block_mask
         
@@ -625,6 +649,48 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                     crossattn_cache=self.crossattn_cache,
                     current_start=current_start_frame * self.frame_seq_length,
                 )
+            
+            # Schedule prefetch for potential upcoming prompt switch to overlap prep with compute
+            # If the next block will trigger a switch, prefetch frames/mask/timestep on a side stream
+            try:
+                predicted_start_frame = current_start_frame + current_num_frames
+                if next_switch_pos is not None and predicted_start_frame >= next_switch_pos and self._prefetch_stream is not None:
+                    num_recache_frames = predicted_start_frame if self.local_attn_size == -1 else min(self.local_attn_size, predicted_start_frame)
+                    recache_start_frame = predicted_start_frame - num_recache_frames
+                    # Slice frames from output (CPU or GPU)
+                    frames_cpu = output[:, recache_start_frame:predicted_start_frame]
+                    target_device = noise.device
+                    with torch.cuda.stream(self._prefetch_stream):
+                        frames_prefetch = frames_cpu
+                        if frames_prefetch.device.type == "cpu":
+                            try:
+                                frames_prefetch = frames_prefetch.pin_memory()
+                            except Exception:
+                                pass
+                            frames_prefetch = frames_prefetch.to(target_device, non_blocking=True)
+                        # Build/cached mask on device
+                        block_mask_prefetch = self._get_block_mask(
+                            device=target_device,
+                            num_frames=num_recache_frames,
+                            local_attn_size=self.local_attn_size
+                        )
+                        # Build context timestep on device
+                        context_prefetch = torch.ones(
+                            [batch_size, num_recache_frames],
+                            device=target_device,
+                            dtype=torch.int64
+                        ) * self.args.context_noise
+                        # Save to cache
+                        self._prefetch_cache = {
+                            "start_frame": recache_start_frame,
+                            "num_frames": num_recache_frames,
+                            "frames": frames_prefetch,
+                            "mask": block_mask_prefetch,
+                            "context_timestep": context_prefetch,
+                        }
+            except Exception:
+                # Prefetch is opportunistic; ignore failures
+                pass
 
             # End block timing
             if latency_tracker:
