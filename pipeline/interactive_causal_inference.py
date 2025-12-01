@@ -231,6 +231,8 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         
         recache_setup_start = time.perf_counter()
         
+        # local_attn_size == -1 means global attention
+        # otherwise, use local attention with the given size
         num_recache_frames = current_start_frame if self.local_attn_size == -1 else min(self.local_attn_size, current_start_frame)
         recache_start_frame = current_start_frame - num_recache_frames
         

@@ -244,25 +244,10 @@ class CausalWanSelfAttention(nn.Module):
                     kv_cache["global_end_index"].item() - num_evicted_tokens
                 local_start_index = local_end_index - num_new_tokens
 
-                # Construct full k, v for attention computation (without modifying the original cache)
-                # Create temporary k, v for computation
-                temp_k = kv_cache["k"].clone()
-                temp_v = kv_cache["v"].clone()
-                
-                # Apply rolling update to the temporary cache
-                temp_k[:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                    temp_k[:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-                temp_v[:, sink_tokens:sink_tokens + num_rolled_tokens] = \
-                    temp_v[:, sink_tokens + num_evicted_tokens:sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
-                
-                # Insert new key/value into the temporary cache
                 # Protect sink_tokens only during recomputation; regular forward generation allows writing into the initial sink region
                 write_start_index = max(local_start_index, sink_tokens) if is_recompute else local_start_index
                 roped_offset = max(0, write_start_index - local_start_index)
                 write_len = max(0, local_end_index - write_start_index)
-                if write_len > 0:
-                    temp_k[:, write_start_index:local_end_index] = roped_key[:, roped_offset:roped_offset + write_len]
-                    temp_v[:, write_start_index:local_end_index] = v[:, roped_offset:roped_offset + write_len]
 
                 # Save cache update info for later use
                 cache_update_info = {
@@ -287,16 +272,10 @@ class CausalWanSelfAttention(nn.Module):
                 local_end_index = kv_cache["local_end_index"].item() + current_end - kv_cache["global_end_index"].item()
                 local_start_index = local_end_index - num_new_tokens
 
-                # Construct full k, v for attention computation (without modifying the original cache)
-                temp_k = kv_cache["k"].clone()
-                temp_v = kv_cache["v"].clone()
                 # Protect sink_tokens only during recomputation; regular forward generation allows writing into the initial sink region
                 write_start_index = max(local_start_index, sink_tokens) if is_recompute else local_start_index
                 roped_offset = max(0, write_start_index - local_start_index)
                 write_len = max(0, local_end_index - write_start_index)
-                if write_len > 0:
-                    temp_k[:, write_start_index:local_end_index] = roped_key[:, roped_offset:roped_offset + write_len]
-                    temp_v[:, write_start_index:local_end_index] = v[:, roped_offset:roped_offset + write_len]
 
                 # Save cache update info for later use
                 cache_update_info = {
@@ -314,34 +293,51 @@ class CausalWanSelfAttention(nn.Module):
             # if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:
             #     print(f"local_start_index: {local_start_index}, local_end_index: {local_end_index}")
 
-            # Use temporary k, v to compute attention
+            # Assemble attention KV without cloning full cache
             if sink_tokens > 0:
-                # Concatenate sink tokens and local window tokens, keeping total length strictly below max_attention_size
-                local_budget = self.max_attention_size - sink_tokens
-                k_sink = temp_k[:, :sink_tokens]
-                v_sink = temp_v[:, :sink_tokens]
-                # if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:
-                #     print(f"local_budget: {local_budget}")
+                # Keep total tokens under max_attention_size by allocating budget after sink
+                local_budget = max(0, self.max_attention_size - sink_tokens)
+                k_sink = kv_cache["k"][:, :sink_tokens]
+                v_sink = kv_cache["v"][:, :sink_tokens]
                 if local_budget > 0:
-                    local_start_for_window = max(sink_tokens, local_end_index - local_budget)
-                    k_local = temp_k[:, local_start_for_window:local_end_index]
-                    v_local = temp_v[:, local_start_for_window:local_end_index]
-                    k_cat = torch.cat([k_sink, k_local], dim=1)
-                    v_cat = torch.cat([v_sink, v_local], dim=1)
+                    # Compute how many previous tokens remain after potential eviction this step
+                    prev_local_end = kv_cache["local_end_index"].item()
+                    prev_len_non_sink = max(0, prev_local_end - sink_tokens)
+                    # Compute evicted tokens E for this step (consistent with cache logic)
+                    E = max(0, num_new_tokens + prev_len_non_sink - (kv_cache_size - sink_tokens))
+                    preserved_len = max(0, prev_len_non_sink - E)
+                    # Effective window length capped by budget
+                    budget_len = min(local_budget, preserved_len + num_new_tokens)
+                    new_tail_len = min(num_new_tokens, budget_len)
+                    prev_tail_len = budget_len - new_tail_len
+                    # Slice tails
+                    if prev_tail_len > 0:
+                        prev_tail_start = sink_tokens + (prev_len_non_sink - prev_tail_len)
+                        k_prev_tail = kv_cache["k"][:, prev_tail_start:prev_tail_start + prev_tail_len]
+                        v_prev_tail = kv_cache["v"][:, prev_tail_start:prev_tail_start + prev_tail_len]
+                    else:
+                        # Create empty slices with correct shape by slicing a zero-length range
+                        k_prev_tail = kv_cache["k"][:, sink_tokens:sink_tokens]
+                        v_prev_tail = kv_cache["v"][:, sink_tokens:sink_tokens]
+                    if new_tail_len > 0:
+                        k_new_tail = roped_key[:, num_new_tokens - new_tail_len:num_new_tokens]
+                        v_new_tail = v[:, num_new_tokens - new_tail_len:num_new_tokens]
+                    else:
+                        k_new_tail = roped_key[:, 0:0]
+                        v_new_tail = v[:, 0:0]
+                    # Concatenate sink + previous tail + new tail
+                    k_cat = torch.cat([k_sink, k_prev_tail, k_new_tail], dim=1)
+                    v_cat = torch.cat([v_sink, v_prev_tail, v_new_tail], dim=1)
                 else:
                     k_cat = k_sink
                     v_cat = v_sink
-                x = attention(
-                    roped_query,
-                    k_cat,
-                    v_cat
-                )
+                x = attention(roped_query, k_cat, v_cat)
             else:
                 window_start = max(0, local_end_index - self.max_attention_size)
                 x = attention(
                     roped_query,
-                    temp_k[:, window_start:local_end_index],
-                    temp_v[:, window_start:local_end_index]
+                    kv_cache["k"][:, window_start:local_end_index],
+                    kv_cache["v"][:, window_start:local_end_index]
                 )
 
         # output
