@@ -102,18 +102,34 @@ class WanVAEWrapper(torch.nn.Module):
 
         device, dtype = latent.device, latent.dtype
         
-        # Check if VAE model is quantized to FP8 and adjust input dtype accordingly
-        model_dtype = next(self.model.parameters()).dtype
-        if model_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-            # Convert inputs to match quantized model
-            input_dtype = model_dtype
-            print(f"[VAE] Converting inputs to {model_dtype} to match quantized model")
-        else:
-            # Keep original dtype
-            input_dtype = dtype
+        # Check if VAE model is quantized and handle appropriately
+        try:
+            model_dtype = next(self.model.parameters()).dtype
+            is_quantized = hasattr(self.model, '_modules') and any(
+                'quantized' in str(type(module)).lower() for module in self.model.modules()
+            )
+        except:
+            model_dtype = dtype
+            is_quantized = False
             
-        scale = [self.mean.to(device=device, dtype=input_dtype),
-                 1.0 / self.std.to(device=device, dtype=input_dtype)]
+        if is_quantized:
+            print(f"[VAE] Using INT8 quantized model")
+            # For INT8 quantized models, PyTorch handles dtype conversion automatically
+            # Just use original input dtype
+            scale = [self.mean.to(device=device, dtype=dtype),
+                     1.0 / self.std.to(device=device, dtype=dtype)]
+            input_dtype = dtype
+        elif model_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            print(f"[VAE] Using FP8 quantized model: {model_dtype}")
+            # Use FP8 for everything - let it fail if operations aren't supported
+            scale = [self.mean.to(device=device, dtype=model_dtype),
+                     1.0 / self.std.to(device=device, dtype=model_dtype)]
+            input_dtype = model_dtype
+        else:
+            # Keep original dtype for non-quantized models
+            scale = [self.mean.to(device=device, dtype=dtype),
+                     1.0 / self.std.to(device=device, dtype=dtype)]
+            input_dtype = dtype
 
         if use_cache:
             decode_function = self.model.cached_decode
@@ -122,7 +138,7 @@ class WanVAEWrapper(torch.nn.Module):
 
         output = []
         for u in zs:
-            # Convert input to match model dtype
+            # Convert input to appropriate dtype
             u_input = u.to(dtype=input_dtype) if input_dtype != dtype else u
             result = decode_function(u_input.unsqueeze(0), scale).float().clamp_(-1, 1).squeeze(0)
             output.append(result)

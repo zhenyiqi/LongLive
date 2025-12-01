@@ -82,9 +82,9 @@ class PersistentInteractivePipeline:
         self.pipeline.generator.to(device=self.device)
         self.pipeline.vae.to(device=self.device)
         
-        # Apply FP8 quantization AFTER moving to device
+        # Apply quantization AFTER moving to device
         if getattr(self.config, "quantization", None) and self.config.quantization.get("enabled", False):
-            self._apply_fp8_quantization()
+            self._apply_quantization()
         
         # Debug: Print model dtypes if quantization was attempted
         if getattr(self.config, "quantization", None) and self.config.quantization.get("enabled", False):
@@ -137,79 +137,89 @@ class PersistentInteractivePipeline:
             
         self.pipeline.is_lora_enabled = True
         
-    def _apply_fp8_quantization(self):
-        """Apply FP8 quantization to specified models"""
+    def _apply_quantization(self):
+        """Apply INT8 quantization to specified models"""
         quant_config = self.config.quantization
-        quant_dtype = quant_config.get("dtype", "float8_e4m3fn")
+        quant_dtype = quant_config.get("dtype", "int8")
+        quant_method = quant_config.get("method", "dynamic")
         models_to_quantize = quant_config.get("models", [])
         
-        print(f"Applying FP8 quantization ({quant_dtype}) to models: {models_to_quantize}")
+        print(f"Applying {quant_dtype} quantization (method: {quant_method}) to models: {models_to_quantize}")
         
-        # Convert string dtype to torch dtype
-        if quant_dtype == "float8_e4m3fn":
-            target_dtype = torch.float8_e4m3fn
-        elif quant_dtype == "float8_e5m2":
-            target_dtype = torch.float8_e5m2
+        if quant_dtype == "int8":
+            self._apply_int8_quantization(models_to_quantize, quant_method)
+        elif quant_dtype in ["float8_e4m3fn", "float8_e5m2"]:
+            print("Warning: FP8 quantization not implemented in this version")
+            print("Use dtype: 'int8' for stable quantization")
+            raise RuntimeError("FP8 quantization not supported - use INT8")
         else:
-            print(f"Warning: Unsupported FP8 dtype {quant_dtype}, skipping quantization")
-            return
+            raise RuntimeError(f"Unsupported quantization dtype: {quant_dtype}")
             
-        # Check if FP8 is actually supported
-        if not hasattr(torch, 'float8_e4m3fn'):
-            print(f"Warning: FP8 dtype not supported in this PyTorch version ({torch.__version__})")
-            print("FP8 requires PyTorch 2.1+ with CUDA support")
-            return
+    def _apply_int8_quantization(self, models_to_quantize: list, method: str):
+        """Apply INT8 quantization using PyTorch's quantization APIs"""
+        import torch.quantization as quant
             
         try:
             # Quantize VAE if requested
             if "vae" in models_to_quantize:
-                print("Quantizing VAE to FP8...")
+                print("Quantizing VAE to INT8...")
                 quant_start = time.perf_counter()
                 
-                # Use PyTorch's built-in quantization if available, otherwise manual conversion
-                if hasattr(torch.nn.utils, 'convert_to_float8'):
-                    # Use PyTorch's native FP8 conversion if available
-                    print("Using PyTorch native FP8 conversion")
-                    torch.nn.utils.convert_to_float8(self.pipeline.vae, dtype=target_dtype)
+                if method == "dynamic":
+                    # Dynamic quantization (no calibration needed)
+                    self.pipeline.vae = quant.quantize_dynamic(
+                        self.pipeline.vae, 
+                        {torch.nn.Conv2d, torch.nn.Conv3d, torch.nn.Linear}, 
+                        dtype=torch.qint8
+                    )
                 else:
-                    # Manual conversion with comprehensive dtype matching
-                    print("Using manual FP8 conversion")
-                    self._manual_fp8_conversion(self.pipeline.vae, target_dtype)
+                    print(f"Static quantization method '{method}' not implemented yet")
+                    print("Using dynamic quantization instead")
+                    self.pipeline.vae = quant.quantize_dynamic(
+                        self.pipeline.vae, 
+                        {torch.nn.Conv2d, torch.nn.Conv3d, torch.nn.Linear}, 
+                        dtype=torch.qint8
+                    )
                 
                 quant_time = (time.perf_counter() - quant_start) * 1000
                 print(f"VAE quantization completed: {quant_time:.2f} ms")
+                print(f"  - Quantized Conv2d, Conv3d, and Linear layers to INT8")
                 
-                # Validate quantization worked
-                self._validate_quantization("VAE", self.pipeline.vae, target_dtype)
-            
             # Quantize text encoder if requested  
             if "text_encoder" in models_to_quantize:
-                print("Quantizing text encoder to FP8...")
+                print("Quantizing text encoder to INT8...")
                 quant_start = time.perf_counter()
                 
-                for param in self.pipeline.text_encoder.parameters():
-                    if param.dtype == torch.bfloat16 or param.dtype == torch.float32:
-                        param.data = param.data.to(target_dtype)
+                self.pipeline.text_encoder = quant.quantize_dynamic(
+                    self.pipeline.text_encoder,
+                    {torch.nn.Linear, torch.nn.Embedding},
+                    dtype=torch.qint8
+                )
                         
                 quant_time = (time.perf_counter() - quant_start) * 1000
                 print(f"Text encoder quantization completed: {quant_time:.2f} ms")
             
-            # Quantize generator if requested (more complex due to LoRA)
+            # Quantize generator if requested
             if "generator" in models_to_quantize:
-                print("Quantizing generator to FP8...")
+                print("Quantizing generator to INT8...")
                 quant_start = time.perf_counter()
                 
-                # Skip LoRA parameters, only quantize base model
-                for name, param in self.pipeline.generator.named_parameters():
-                    if "lora" not in name.lower() and (param.dtype == torch.bfloat16 or param.dtype == torch.float32):
-                        param.data = param.data.to(target_dtype)
+                # Note: Be careful with LoRA + quantization
+                if hasattr(self.pipeline, 'is_lora_enabled') and self.pipeline.is_lora_enabled:
+                    print("Warning: Quantizing generator with LoRA may affect adapter performance")
+                
+                self.pipeline.generator = quant.quantize_dynamic(
+                    self.pipeline.generator,
+                    {torch.nn.Conv2d, torch.nn.Conv3d, torch.nn.Linear},
+                    dtype=torch.qint8
+                )
                         
                 quant_time = (time.perf_counter() - quant_start) * 1000
                 print(f"Generator quantization completed: {quant_time:.2f} ms")
                 
         except Exception as e:
-            print(f"FP8 quantization failed: {e}")
-            print("Continuing with original precision...")
+            print(f"INT8 quantization failed: {e}")
+            raise RuntimeError(f"Quantization failed: {e}") from e
             
     def _manual_fp8_conversion(self, model: torch.nn.Module, target_dtype: torch.dtype):
         """Manual FP8 conversion ensuring all tensors have consistent dtype"""
