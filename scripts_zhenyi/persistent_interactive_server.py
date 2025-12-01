@@ -216,14 +216,19 @@ class PersistentInteractivePipeline:
                 print("Quantizing text encoder to INT8...")
                 quant_start = time.perf_counter()
                 
-                self.pipeline.text_encoder = quant.quantize_dynamic(
-                    self.pipeline.text_encoder,
-                    {torch.nn.Linear, torch.nn.Embedding},
-                    dtype=torch.qint8
-                )
-                        
-                quant_time = (time.perf_counter() - quant_start) * 1000
-                print(f"Text encoder quantization completed: {quant_time:.2f} ms")
+                # Skip Embedding layers as they need special float_qparams config
+                try:
+                    self.pipeline.text_encoder = quant.quantize_dynamic(
+                        self.pipeline.text_encoder,
+                        {torch.nn.Linear},  # Only Linear layers, skip Embedding
+                        dtype=torch.qint8
+                    )
+                    quant_time = (time.perf_counter() - quant_start) * 1000
+                    print(f"Text encoder quantization completed: {quant_time:.2f} ms")
+                    print(f"  - Quantized Linear layers only (Embedding layers skipped)")
+                except Exception as e:
+                    print(f"Text encoder quantization failed: {e}")
+                    print("Continuing without text encoder quantization...")
             
             # Quantize generator if requested
             if "generator" in models_to_quantize:
