@@ -36,3 +36,11 @@ adapter:
   dropout: 0.0                # LoRA dropout rate
   dtype: "bfloat16"          # Data type for LoRA parameters: "bfloat16", "float16", "float32"
   verbose: false              # Whether to print all target module names
+
+# FP8 Quantization
+quantization:
+  enabled: true                # Enable FP8 quantization
+  dtype: "float8_e4m3fn"      # FP8 format (float8_e4m3fn or float8_e5m2)
+  models: ["vae"]             # Which models to quantize: ["generator", "text_encoder", "vae"]
+  preserve_lora: true         # Skip LoRA parameters when quantizing generator
+  timing: true                # Track quantization timing in latency tracker

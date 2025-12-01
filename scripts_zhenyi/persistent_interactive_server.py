@@ -30,7 +30,7 @@ from pipeline.interactive_causal_inference import InteractiveCausalInferencePipe
 from utils.misc import set_seed
 
 class PersistentInteractivePipeline:
-    def __init__(self, config_path: str):
+    def __init__(self, config_path: str, cli_args=None):
         """Initialize and compile the pipeline once"""
         print("="*60)
         print("INITIALIZING PERSISTENT INTERACTIVE PIPELINE")
@@ -38,6 +38,18 @@ class PersistentInteractivePipeline:
         
         # Load config
         self.config = OmegaConf.load(config_path)
+        
+        # Override quantization config with CLI args if provided
+        if cli_args:
+            if cli_args.fp8:
+                if not hasattr(self.config, 'quantization'):
+                    self.config.quantization = {}
+                self.config.quantization.enabled = True
+                print("FP8 quantization enabled via --fp8 flag")
+            elif cli_args.no_fp8:
+                if hasattr(self.config, 'quantization'):
+                    self.config.quantization.enabled = False
+                print("FP8 quantization disabled via --no-fp8 flag")
         
         # Setup device
         if "LOCAL_RANK" in os.environ:
@@ -64,6 +76,10 @@ class PersistentInteractivePipeline:
         if getattr(self.config, "adapter", None):
             self._setup_lora()
             
+        # Apply FP8 quantization if enabled
+        if getattr(self.config, "quantization", None) and self.config.quantization.get("enabled", False):
+            self._apply_fp8_quantization()
+        
         # Move to device and dtype
         print("dtype", self.pipeline.generator.model.dtype)
         self.pipeline = self.pipeline.to(dtype=torch.bfloat16)
@@ -114,6 +130,71 @@ class PersistentInteractivePipeline:
             print("LoRA weights loaded")
             
         self.pipeline.is_lora_enabled = True
+        
+    def _apply_fp8_quantization(self):
+        """Apply FP8 quantization to specified models"""
+        quant_config = self.config.quantization
+        quant_dtype = quant_config.get("dtype", "float8_e4m3fn")
+        models_to_quantize = quant_config.get("models", [])
+        
+        print(f"Applying FP8 quantization ({quant_dtype}) to models: {models_to_quantize}")
+        
+        # Convert string dtype to torch dtype
+        if quant_dtype == "float8_e4m3fn":
+            target_dtype = torch.float8_e4m3fn
+        elif quant_dtype == "float8_e5m2":
+            target_dtype = torch.float8_e5m2
+        else:
+            print(f"Warning: Unsupported FP8 dtype {quant_dtype}, skipping quantization")
+            return
+            
+        try:
+            # Quantize VAE if requested
+            if "vae" in models_to_quantize:
+                print("Quantizing VAE to FP8...")
+                quant_start = time.perf_counter()
+                
+                # Quantize VAE model parameters
+                for param in self.pipeline.vae.parameters():
+                    if param.dtype == torch.bfloat16 or param.dtype == torch.float32:
+                        param.data = param.data.to(target_dtype)
+                        
+                # Quantize VAE buffers 
+                for name, buffer in self.pipeline.vae.named_buffers():
+                    if buffer.dtype == torch.bfloat16 or buffer.dtype == torch.float32:
+                        buffer.data = buffer.data.to(target_dtype)
+                
+                quant_time = (time.perf_counter() - quant_start) * 1000
+                print(f"VAE quantization completed: {quant_time:.2f} ms")
+            
+            # Quantize text encoder if requested  
+            if "text_encoder" in models_to_quantize:
+                print("Quantizing text encoder to FP8...")
+                quant_start = time.perf_counter()
+                
+                for param in self.pipeline.text_encoder.parameters():
+                    if param.dtype == torch.bfloat16 or param.dtype == torch.float32:
+                        param.data = param.data.to(target_dtype)
+                        
+                quant_time = (time.perf_counter() - quant_start) * 1000
+                print(f"Text encoder quantization completed: {quant_time:.2f} ms")
+            
+            # Quantize generator if requested (more complex due to LoRA)
+            if "generator" in models_to_quantize:
+                print("Quantizing generator to FP8...")
+                quant_start = time.perf_counter()
+                
+                # Skip LoRA parameters, only quantize base model
+                for name, param in self.pipeline.generator.named_parameters():
+                    if "lora" not in name.lower() and (param.dtype == torch.bfloat16 or param.dtype == torch.float32):
+                        param.data = param.data.to(target_dtype)
+                        
+                quant_time = (time.perf_counter() - quant_start) * 1000
+                print(f"Generator quantization completed: {quant_time:.2f} ms")
+                
+        except Exception as e:
+            print(f"FP8 quantization failed: {e}")
+            print("Continuing with original precision...")
         
     def run_inference(self, prompts_list: List[List[str]], switch_frame_indices: List[int], 
                      output_path: str = None, enable_timing: bool = True):
@@ -259,10 +340,14 @@ def main():
                        help="Run inference on data file and exit")
     parser.add_argument("--output_dir", type=str, default="/tmp/persistent_outputs",
                        help="Output directory for videos")
+    parser.add_argument("--fp8", action="store_true",
+                       help="Enable FP8 quantization (overrides config)")
+    parser.add_argument("--no-fp8", action="store_true",
+                       help="Disable FP8 quantization (overrides config)")
     args = parser.parse_args()
     
     # Initialize persistent pipeline
-    persistent_pipeline = PersistentInteractivePipeline(args.config_path)
+    persistent_pipeline = PersistentInteractivePipeline(args.config_path, args)
     
     if args.data_path:
         # Run once on data file and exit
