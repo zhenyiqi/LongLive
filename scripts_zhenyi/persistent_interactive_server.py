@@ -133,6 +133,8 @@ class PersistentInteractivePipeline:
                             has_fp16_weights=False,
                             threshold=6.0,
                         )
+                    # Ensure the quantized layer lives on the same (CUDA) device as the original
+                    quant_layer = quant_layer.to(child.weight.device)
                     with torch.no_grad():
                         quant_layer.weight.copy_(child.weight.detach())
                         if bias:
