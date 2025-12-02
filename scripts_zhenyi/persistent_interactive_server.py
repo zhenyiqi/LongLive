@@ -250,7 +250,7 @@ class PersistentInteractivePipeline:
             self.config.num_samples,
             self.config.num_output_frames, 
             16, 60, 104
-        ], device=self.device, dtype=torch.bfloat16)
+        ], device=self.device, dtype=torch.float16)
         
         # Run inference (text encoder and VAE already compiled after first run!)
         inference_start = time.perf_counter()
