@@ -61,15 +61,24 @@ class PersistentInteractivePipeline:
         if self.config.generator_ckpt:
             self._load_generator_weights()
             
-        if getattr(self.config, "adapter", None):
-            self._setup_lora()
-            
         # Move to device and dtype first
         print("dtype", self.pipeline.generator.model.dtype)
         # Use float16 for BitsAndBytes int8 compatibility
+        print("Converting all models to float16 for quantization compatibility...")
+        
+        # Convert each component individually to ensure complete conversion
+        self.pipeline.text_encoder = self.pipeline.text_encoder.to(dtype=torch.float16, device=self.device)
+        self.pipeline.generator = self.pipeline.generator.to(dtype=torch.float16, device=self.device)  
+        self.pipeline.vae = self.pipeline.vae.to(dtype=torch.float16, device=self.device)
+        
+        # Also convert the overall pipeline
         self.pipeline = self.pipeline.to(dtype=torch.float16)
-        self.pipeline.generator.to(device=self.device)
-        self.pipeline.vae.to(device=self.device)
+        
+        # Setup LoRA AFTER dtype conversion to ensure consistency
+        if getattr(self.config, "adapter", None):
+            self._setup_lora()
+            # Ensure LoRA adapters are also float16
+            self.pipeline.generator = self.pipeline.generator.to(dtype=torch.float16)
         
         # Optional: GPU quantization via bitsandbytes
         quant_cfg = getattr(self.config, "quantization", None)
