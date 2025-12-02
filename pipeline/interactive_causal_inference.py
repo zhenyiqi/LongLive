@@ -368,7 +368,14 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                                                    num_prompts=len(prompts),
                                                    compiled=self._text_encoder_compiled):
                     torch.compiler.cudagraph_mark_step_begin()
-                    cond_list.append(self.text_encoder._compiled_forward(text_prompts=prompts))
+                    out = self.text_encoder._compiled_forward(text_prompts=prompts)
+                    # Prevent CUDA Graph replay from aliasing previously returned outputs
+                    try:
+                        if isinstance(out, dict) and "prompt_embeds" in out:
+                            out["prompt_embeds"] = out["prompt_embeds"].clone()
+                    except Exception:
+                        pass
+                    cond_list.append(out)
                 encoding_time = (time.perf_counter() - encoding_start) * 1000
                 self._log_timing(f"Segment {i} encoded", encoding_time)
         else:
@@ -376,7 +383,14 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             for i, prompts in enumerate(text_prompts_list):
                 encoding_start = time.perf_counter()
                 torch.compiler.cudagraph_mark_step_begin()
-                cond_list.append(self.text_encoder._compiled_forward(text_prompts=prompts))
+                out = self.text_encoder._compiled_forward(text_prompts=prompts)
+                # Prevent CUDA Graph replay from aliasing previously returned outputs
+                try:
+                    if isinstance(out, dict) and "prompt_embeds" in out:
+                        out["prompt_embeds"] = out["prompt_embeds"].clone()
+                except Exception:
+                    pass
+                cond_list.append(out)
                 encoding_time = (time.perf_counter() - encoding_start) * 1000
                 self._log_timing(f"Segment {i} encoded", encoding_time)
             
