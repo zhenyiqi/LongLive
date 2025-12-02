@@ -113,6 +113,10 @@ class FlowMatchScheduler():
         self.inverse_timesteps = inverse_timesteps
         self.extra_one_step = extra_one_step
         self.reverse_sigmas = reverse_sigmas
+        # Per-device cache to avoid repeated .to(device) each step
+        self._device_cache = {}
+        # Lookup table mapping integer timestep (0..num_train_timesteps) to the closest index in self.timesteps
+        self.timestep_to_index = None
         self.set_timesteps(num_inference_steps)
 
     def set_timesteps(self, num_inference_steps=100, denoising_strength=1.0, training=False):
@@ -131,6 +135,10 @@ class FlowMatchScheduler():
         if self.reverse_sigmas:
             self.sigmas = 1 - self.sigmas
         self.timesteps = self.sigmas * self.num_train_timesteps
+        # Invalidate device caches since schedule changed
+        self._device_cache = {}
+        # Build or rebuild integer timestep -> index mapping on CPU to avoid argmin each step
+        self._build_timestep_lookup()
         if training:
             x = self.timesteps
             y = torch.exp(-2 * ((x - num_inference_steps / 2) /
@@ -140,19 +148,88 @@ class FlowMatchScheduler():
                 (num_inference_steps / y_shifted.sum())
             self.linear_timesteps_weights = bsmntw_weighing
 
+    def _build_timestep_lookup(self) -> None:
+        """
+        Precompute a lookup that maps integer timesteps in [0, num_train_timesteps]
+        to the closest index in self.timesteps. This avoids an O(B*S) argmin during inference.
+        """
+        # Ensure tensors are on CPU for lightweight preprocessing
+        timesteps_cpu = self.timesteps.detach().to('cpu', dtype=torch.float32)
+        # Create integer grid [0, 1, 2, ..., N]
+        t_grid = torch.arange(
+            0, int(self.num_train_timesteps) + 1, dtype=torch.float32, device=timesteps_cpu.device)
+        # Compute nearest indices (shape: [N+1])
+        # This is a one-time O(N^2) on small N (typically 1000), negligible.
+        indices = (timesteps_cpu.unsqueeze(0) - t_grid.unsqueeze(1)).abs().argmin(dim=1)
+        self.timestep_to_index = indices.to(dtype=torch.int64)  # CPU tensor
+
+    def _ensure_device_cache(self, device: torch.device) -> None:
+        """
+        Lazily materialize and cache per-device schedule tensors to avoid repeated device transfers.
+        """
+        key = str(device)
+        if key in self._device_cache:
+            return
+        sigmas_dev = self.sigmas.to(device=device)
+        timesteps_dev = self.timesteps.to(device=device, dtype=torch.int64)
+        # Precompute per-integer timestep sigma table on device for fast gathers
+        # Note: clamp index to valid range just in case
+        idx = self.timestep_to_index.clamp_(0, sigmas_dev.numel() - 1)
+        sigma_table = sigmas_dev.index_select(0, idx.to(device=device))
+        # Also precompute "next sigma" table for step() fast path
+        next_idx = (idx + 1).clamp_(0, sigmas_dev.numel() - 1)
+        sigma_next_table = sigmas_dev.index_select(0, next_idx.to(device=device))
+        self._device_cache[key] = {
+            "sigmas": sigmas_dev,
+            "timesteps": timesteps_dev,
+            "sigma_table": sigma_table,
+            "sigma_next_table": sigma_next_table
+        }
+
+    def map_int_timestep_to_sigma(self, timestep: torch.Tensor, device: torch.device) -> torch.Tensor:
+        """
+        Fast mapping from integer timesteps (int32/int64) to sigma values using the precomputed lookup.
+        Returns a 1D tensor of sigmas matching the flattened timestep input.
+        """
+        if timestep.ndim == 2:
+            timestep = timestep.flatten(0, 1)
+        t_int = timestep.to(dtype=torch.int64).clamp(0, int(self.num_train_timesteps))
+        self._ensure_device_cache(device)
+        cache = self._device_cache[str(device)]
+        return cache["sigma_table"].index_select(0, t_int.to(device=device))
+
     def step(self, model_output, timestep, sample, to_final=False):
         if timestep.ndim == 2:
             timestep = timestep.flatten(0, 1)
-        self.sigmas = self.sigmas.to(model_output.device)
-        self.timesteps = self.timesteps.to(model_output.device)
-        timestep_id = torch.argmin(
-            (self.timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1)
-        sigma = self.sigmas[timestep_id].reshape(-1, 1, 1, 1)
-        if to_final or (timestep_id + 1 >= len(self.timesteps)).any():
-            sigma_ = 1 if (
-                self.inverse_timesteps or self.reverse_sigmas) else 0
+        device = model_output.device
+        # Fast path for integer timesteps
+        if torch.is_floating_point(timestep) is False or timestep.dtype in (torch.int32, torch.int64):
+            self._ensure_device_cache(device)
+            cache = self._device_cache[str(device)]
+            t_int = timestep.to(dtype=torch.int64).clamp(0, int(self.num_train_timesteps))
+            sigma = cache["sigma_table"].index_select(0, t_int).reshape(-1, 1, 1, 1)
+            # Final-step handling stays the same
+            if to_final:
+                sigma_ = 1 if (self.inverse_timesteps or self.reverse_sigmas) else 0
+            else:
+                # If already at (or beyond) the last valid index, use final sigma rule
+                at_last = (t_int >= int(self.num_train_timesteps))
+                if at_last.any():
+                    sigma_ = 1 if (self.inverse_timesteps or self.reverse_sigmas) else 0
+                else:
+                    sigma_ = cache["sigma_next_table"].index_select(0, t_int).reshape(-1, 1, 1, 1)
         else:
-            sigma_ = self.sigmas[timestep_id + 1].reshape(-1, 1, 1, 1)
+            # Fallback path (float timesteps): original argmin-based implementation
+            self.sigmas = self.sigmas.to(device)
+            self.timesteps = self.timesteps.to(device)
+            timestep_id = torch.argmin(
+                (self.timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1)
+            sigma = self.sigmas[timestep_id].reshape(-1, 1, 1, 1)
+            if to_final or (timestep_id + 1 >= len(self.timesteps)).any():
+                sigma_ = 1 if (
+                    self.inverse_timesteps or self.reverse_sigmas) else 0
+            else:
+                sigma_ = self.sigmas[timestep_id + 1].reshape(-1, 1, 1, 1)
         prev_sample = sample + model_output * (sigma_ - sigma)
         return prev_sample
 
@@ -167,11 +244,17 @@ class FlowMatchScheduler():
         """
         if timestep.ndim == 2:
             timestep = timestep.flatten(0, 1)
-        self.sigmas = self.sigmas.to(noise.device)
-        self.timesteps = self.timesteps.to(noise.device)
-        timestep_id = torch.argmin(
-            (self.timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1)
-        sigma = self.sigmas[timestep_id].reshape(-1, 1, 1, 1)
+        device = noise.device
+        # Fast path for integer timesteps
+        if torch.is_floating_point(timestep) is False or timestep.dtype in (torch.int32, torch.int64):
+            sigma = self.map_int_timestep_to_sigma(timestep, device).reshape(-1, 1, 1, 1)
+        else:
+            # Fallback path (float timesteps): original argmin-based implementation
+            self.sigmas = self.sigmas.to(device)
+            self.timesteps = self.timesteps.to(device)
+            timestep_id = torch.argmin(
+                (self.timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1)
+            sigma = self.sigmas[timestep_id].reshape(-1, 1, 1, 1)
         sample = (1 - sigma) * original_samples + sigma * noise
         return sample.type_as(noise)
 

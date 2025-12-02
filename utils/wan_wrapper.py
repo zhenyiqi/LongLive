@@ -218,15 +218,18 @@ class WanDiffusionWrapper(torch.nn.Module):
         """
         # use higher precision for calculations
         original_dtype = flow_pred.dtype
-        flow_pred, xt, sigmas, timesteps = map(
-            lambda x: x.double().to(flow_pred.device), [flow_pred, xt,
-                                                        self.scheduler.sigmas,
-                                                        self.scheduler.timesteps]
-        )
-
-        timestep_id = torch.argmin(
-            (timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1)
-        sigma_t = sigmas[timestep_id].reshape(-1, 1, 1, 1)
+        flow_pred = flow_pred.to(dtype=torch.float64, device=flow_pred.device)
+        xt = xt.to(dtype=torch.float64, device=flow_pred.device)
+        # Prefer fast integer mapping path if timesteps are ints; otherwise fall back to argmin
+        if torch.is_floating_point(timestep) is False or timestep.dtype in (torch.int32, torch.int64):
+            sigma_t = self.scheduler.map_int_timestep_to_sigma(
+                timestep, flow_pred.device).to(dtype=torch.float64).reshape(-1, 1, 1, 1)
+        else:
+            sigmas = self.scheduler.sigmas.to(flow_pred.device, dtype=torch.float64)
+            timesteps = self.scheduler.timesteps.to(flow_pred.device, dtype=torch.float64)
+            timestep_id = torch.argmin(
+                (timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1)
+            sigma_t = sigmas[timestep_id].reshape(-1, 1, 1, 1)
         x0_pred = xt - sigma_t * flow_pred
         return x0_pred.to(original_dtype)
 
@@ -242,14 +245,18 @@ class WanDiffusionWrapper(torch.nn.Module):
         """
         # use higher precision for calculations
         original_dtype = x0_pred.dtype
-        x0_pred, xt, sigmas, timesteps = map(
-            lambda x: x.double().to(x0_pred.device), [x0_pred, xt,
-                                                      scheduler.sigmas,
-                                                      scheduler.timesteps]
-        )
-        timestep_id = torch.argmin(
-            (timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1)
-        sigma_t = sigmas[timestep_id].reshape(-1, 1, 1, 1)
+        x0_pred = x0_pred.to(dtype=torch.float64, device=x0_pred.device)
+        xt = xt.to(dtype=torch.float64, device=x0_pred.device)
+        # Prefer fast integer mapping path if timesteps are ints; otherwise fall back to argmin
+        if torch.is_floating_point(timestep) is False or timestep.dtype in (torch.int32, torch.int64):
+            sigma_t = scheduler.map_int_timestep_to_sigma(
+                timestep, x0_pred.device).to(dtype=torch.float64).reshape(-1, 1, 1, 1)
+        else:
+            sigmas = scheduler.sigmas.to(x0_pred.device, dtype=torch.float64)
+            timesteps = scheduler.timesteps.to(x0_pred.device, dtype=torch.float64)
+            timestep_id = torch.argmin(
+                (timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1)
+            sigma_t = sigmas[timestep_id].reshape(-1, 1, 1, 1)
         flow_pred = (xt - x0_pred) / sigma_t
         return flow_pred.to(original_dtype)
 
