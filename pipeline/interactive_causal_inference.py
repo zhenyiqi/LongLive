@@ -128,6 +128,48 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         self._log_timing("Skipping VAE compilation (avoiding compilation complexity)")
         self.vae._compiled_decode = self.vae.decode_to_pixel
         self._vae_compiled = False
+    
+    def _pre_allocate_timestep_tensors(self, batch_size: int, max_frames: int, device: torch.device):
+        """Pre-allocate timestep tensors to avoid repeated allocation during inference"""
+        print(f"Pre-allocating timestep tensors for batch_size={batch_size}, max_frames={max_frames}")
+        
+        # Pre-allocate timestep tensors for all denoising steps
+        self._timestep_tensors = {}
+        self._context_timestep_tensors = {}
+        
+        for timestep_val in self.denoising_step_list:
+            # Main denoising timestep tensors (batch_size, max_frames)
+            self._timestep_tensors[timestep_val] = torch.full(
+                (batch_size, max_frames), 
+                timestep_val, 
+                device=device, 
+                dtype=torch.int64
+            )
+        
+        # Context timestep tensor for KV cache updates (reusable)
+        context_val = getattr(self.args, 'context_noise', 0)
+        self._context_timestep_base = torch.full(
+            (batch_size, max_frames), 
+            context_val, 
+            device=device, 
+            dtype=torch.int64
+        )
+        
+        # For recaching - we'll create these dynamically as needed but store references
+        self._recache_timestep_cache = {}
+        
+        # Pre-allocate noise scheduling timestep tensors (flattened for scheduler.add_noise)
+        self._noise_timestep_tensors = {}
+        for timestep_val in self.denoising_step_list:
+            # Flattened version for noise scheduling (batch_size * max_frames)
+            self._noise_timestep_tensors[timestep_val] = torch.full(
+                (batch_size * max_frames,), 
+                timestep_val, 
+                device=device, 
+                dtype=torch.long
+            )
+        
+        print(f"Timestep tensors pre-allocated for {len(self.denoising_step_list)} denoising steps")
             
     def _log_timing(self, message: str, elapsed_ms: float = None):
         """Log timing information"""
@@ -222,8 +264,17 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                     local_attn_size=self.local_attn_size
                 )
         
-        context_timestep = torch.ones([batch_size, num_recache_frames], 
-                                    device=device, dtype=torch.int64) * self.args.context_noise
+        # Use pre-allocated or cached context timestep for recaching
+        cache_key = (batch_size, num_recache_frames)
+        if cache_key not in self._recache_timestep_cache:
+            # Create and cache timestep tensor for this size
+            self._recache_timestep_cache[cache_key] = torch.full(
+                [batch_size, num_recache_frames], 
+                self.args.context_noise,
+                device=device, 
+                dtype=torch.int64
+            )
+        context_timestep = self._recache_timestep_cache[cache_key]
         if use_prefetch:
             # Use the prefetched context_timestep if present
             try:
@@ -437,6 +488,13 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             device=noise.device
         )
 
+        # Pre-allocate timestep tensors to avoid repeated allocation in denoising loop
+        self._pre_allocate_timestep_tensors(
+            batch_size=batch_size,
+            max_frames=self.num_frame_per_block,
+            device=noise.device
+        )
+
         current_start_frame = 0
         self.generator.model.local_attn_size = self.local_attn_size
         print(f"[inference] local_attn_size set on model: {self.generator.model.local_attn_size}")
@@ -491,12 +549,13 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                 timestep_val = float(current_timestep)
                 
                 with time_device_sync(latency_tracker, "interactive_timestep_prep"):
-                    timestep = (
-                        torch.ones([batch_size, current_num_frames],
-                        device=noise.device,
-                        dtype=torch.int64)
-                        * current_timestep
-                    )
+                    # Use pre-allocated timestep tensor (slice if needed for current_num_frames)
+                    if current_num_frames == self.num_frame_per_block:
+                        # Common case: use full pre-allocated tensor
+                        timestep = self._timestep_tensors[current_timestep]
+                    else:
+                        # Handle edge case where block size differs
+                        timestep = self._timestep_tensors[current_timestep][:, :current_num_frames]
 
                 if index < len(self.denoising_step_list) - 1:
                     # Intermediate denoising step (each step is 167ms)
@@ -531,13 +590,18 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                     # 0.2+ms
                     with time_device_sync(latency_tracker, "interactive_noise_scheduling"):
                         next_timestep = self.denoising_step_list[index + 1]
+                        # Use pre-allocated noise scheduling timestep tensor
+                        if current_num_frames == self.num_frame_per_block:
+                            # Common case: use full pre-allocated tensor
+                            noise_timestep = self._noise_timestep_tensors[next_timestep]
+                        else:
+                            # Handle edge case: slice the tensor for current size
+                            noise_timestep = self._noise_timestep_tensors[next_timestep][:batch_size * current_num_frames]
+                        
                         noisy_input = self.scheduler.add_noise(
                             denoised_pred.flatten(0, 1),
                             torch.randn_like(denoised_pred.flatten(0, 1)),
-                            next_timestep
-                            * torch.ones(
-                                [batch_size * current_num_frames], device=noise.device, dtype=torch.long
-                            ),
+                            noise_timestep,
                         ).unflatten(0, denoised_pred.shape[:2])
                 else:
                     # Final denoising step (167ms)
@@ -580,7 +644,13 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
 
             # KV cache update with clean context (0.1+ms)
             with time_device_sync(latency_tracker, "interactive_context_prep"):
-                context_timestep = torch.ones_like(timestep) * self.args.context_noise
+                # Use pre-allocated context timestep tensor (slice if needed)
+                if current_num_frames == self.num_frame_per_block:
+                    # Common case: use full pre-allocated tensor
+                    context_timestep = self._context_timestep_base
+                else:
+                    # Handle edge case where block size differs
+                    context_timestep = self._context_timestep_base[:, :current_num_frames]
                 
             # (167ms)
             with time_kv_operations(latency_tracker, "interactive_kv_cache_update", 
