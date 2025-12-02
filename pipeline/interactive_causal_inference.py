@@ -131,17 +131,18 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
     
     def _pre_allocate_timestep_tensors(self, batch_size: int, max_frames: int, device: torch.device):
         """Pre-allocate timestep tensors to avoid repeated allocation during inference"""
-        print(f"Pre-allocating timestep tensors for batch_size={batch_size}, max_frames={max_frames}")
         
         # Pre-allocate timestep tensors for all denoising steps
         self._timestep_tensors = {}
         self._context_timestep_tensors = {}
         
         for timestep_val in self.denoising_step_list:
+            # Convert timestep_val to int key for consistency
+            timestep_key = int(timestep_val.item()) if hasattr(timestep_val, 'item') else int(timestep_val)
             # Main denoising timestep tensors (batch_size, max_frames)
-            self._timestep_tensors[timestep_val] = torch.full(
+            self._timestep_tensors[timestep_key] = torch.full(
                 (batch_size, max_frames), 
-                timestep_val, 
+                timestep_key, 
                 device=device, 
                 dtype=torch.int64
             )
@@ -161,15 +162,15 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         # Pre-allocate noise scheduling timestep tensors (flattened for scheduler.add_noise)
         self._noise_timestep_tensors = {}
         for timestep_val in self.denoising_step_list:
+            # Convert timestep_val to int key for consistency (same as main tensors)
+            timestep_key = int(timestep_val.item()) if hasattr(timestep_val, 'item') else int(timestep_val)
             # Flattened version for noise scheduling (batch_size * max_frames)
-            self._noise_timestep_tensors[timestep_val] = torch.full(
+            self._noise_timestep_tensors[timestep_key] = torch.full(
                 (batch_size * max_frames,), 
-                timestep_val, 
+                timestep_key, 
                 device=device, 
                 dtype=torch.long
             )
-        
-        print(f"Timestep tensors pre-allocated for {len(self.denoising_step_list)} denoising steps")
             
     def _log_timing(self, message: str, elapsed_ms: float = None):
         """Log timing information"""
@@ -550,12 +551,13 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                 
                 with time_device_sync(latency_tracker, "interactive_timestep_prep"):
                     # Use pre-allocated timestep tensor (slice if needed for current_num_frames)
+                    timestep_key = int(current_timestep.item()) if hasattr(current_timestep, 'item') else int(current_timestep)
                     if current_num_frames == self.num_frame_per_block:
                         # Common case: use full pre-allocated tensor
-                        timestep = self._timestep_tensors[current_timestep]
+                        timestep = self._timestep_tensors[timestep_key]
                     else:
                         # Handle edge case where block size differs
-                        timestep = self._timestep_tensors[current_timestep][:, :current_num_frames]
+                        timestep = self._timestep_tensors[timestep_key][:, :current_num_frames]
 
                 if index < len(self.denoising_step_list) - 1:
                     # Intermediate denoising step (each step is 167ms)
@@ -590,13 +592,14 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                     # 0.2+ms
                     with time_device_sync(latency_tracker, "interactive_noise_scheduling"):
                         next_timestep = self.denoising_step_list[index + 1]
+                        next_timestep_key = int(next_timestep.item()) if hasattr(next_timestep, 'item') else int(next_timestep)
                         # Use pre-allocated noise scheduling timestep tensor
                         if current_num_frames == self.num_frame_per_block:
                             # Common case: use full pre-allocated tensor
-                            noise_timestep = self._noise_timestep_tensors[next_timestep]
+                            noise_timestep = self._noise_timestep_tensors[next_timestep_key]
                         else:
                             # Handle edge case: slice the tensor for current size
-                            noise_timestep = self._noise_timestep_tensors[next_timestep][:batch_size * current_num_frames]
+                            noise_timestep = self._noise_timestep_tensors[next_timestep_key][:batch_size * current_num_frames]
                         
                         noisy_input = self.scheduler.add_noise(
                             denoised_pred.flatten(0, 1),
