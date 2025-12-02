@@ -63,36 +63,13 @@ class PersistentInteractivePipeline:
             
         # Move to device and dtype first
         print("dtype", self.pipeline.generator.model.dtype)
-        # Use float16 for BitsAndBytes int8 compatibility
-        print("Converting all models to float16 for quantization compatibility...")
+        self.pipeline = self.pipeline.to(dtype=torch.bfloat16)
+        self.pipeline.generator.to(device=self.device)
+        self.pipeline.vae.to(device=self.device)
         
-        # Convert each component individually to ensure complete conversion
-        self.pipeline.text_encoder = self.pipeline.text_encoder.to(dtype=torch.float16, device=self.device)
-        self.pipeline.generator = self.pipeline.generator.to(dtype=torch.float16, device=self.device)  
-        self.pipeline.vae = self.pipeline.vae.to(dtype=torch.float16, device=self.device)
-        
-        # Also convert the overall pipeline
-        self.pipeline = self.pipeline.to(dtype=torch.float16)
-        
-        # Setup LoRA AFTER dtype conversion to ensure consistency
         if getattr(self.config, "adapter", None):
             self._setup_lora()
-            # Ensure LoRA adapters are also float16
-            self.pipeline.generator = self.pipeline.generator.to(dtype=torch.float16)
         
-        # Optional: GPU quantization via bitsandbytes
-        quant_cfg = getattr(self.config, "quantization", None)
-        if quant_cfg and quant_cfg.get("enabled", False) and torch.cuda.is_available():
-            try:
-                method = str(quant_cfg.get("method", "bnb")).lower()
-                dtype = str(quant_cfg.get("dtype", "int8")).lower()
-                models = quant_cfg.get("models", ["generator"])
-                if method in ["bnb", "bitsandbytes"] or dtype in ["bnb_int8", "bnb_int4", "int4", "int8"]:
-                    self._apply_bnb_quantization(models, dtype)
-                else:
-                    print(f"[Quantization] Skipping unknown method '{method}'.")
-            except Exception as e:
-                print(f"[Quantization] bitsandbytes quantization skipped due to error: {e}")
         
         init_time = (time.perf_counter() - init_start) * 1000
         print(f"Pipeline initialization completed: {init_time:.2f} ms")
@@ -101,83 +78,6 @@ class PersistentInteractivePipeline:
         print("Subsequent inferences will be much faster (~60s vs ~90s)!")
         print("="*60)
     
-    def _apply_bnb_quantization(self, models_to_quantize: list, quant_dtype: str):
-        """
-        Apply bitsandbytes quantization (8-bit or 4-bit) to Linear layers of selected models.
-        - quant_dtype: 'bnb_int8'|'int8' or 'bnb_int4'|'int4'
-        """
-        import torch
-        try:
-            import bitsandbytes as bnb  # type: ignore
-        except Exception as e:
-            raise RuntimeError(f"bitsandbytes is required for GPU quantization: {e}")
-
-        use_int4 = quant_dtype.lower() in ["bnb_int4", "int4"]
-
-        def replace_linear_with_bnb(module: torch.nn.Module) -> torch.nn.Module:
-            for name, child in list(module.named_children()):
-                # Recurse
-                new_child = replace_linear_with_bnb(child)
-                if new_child is not child:
-                    setattr(module, name, new_child)
-                    child = new_child
-                # Replace Linear layers
-                if isinstance(child, torch.nn.Linear):
-                    in_f, out_f = child.in_features, child.out_features
-                    bias = child.bias is not None
-                    if use_int4:
-                        quant_layer = bnb.nn.Linear4bit(
-                            in_f,
-                            out_f,
-                            bias=bias,
-                            compute_dtype=torch.bfloat16,
-                            quant_type="nf4",
-                            compress_statistics=True,
-                            quant_storage=torch.uint8,
-                        )
-                    else:
-                        quant_layer = bnb.nn.Linear8bitLt(
-                            in_f,
-                            out_f,
-                            bias=bias,
-                            has_fp16_weights=False,
-                            threshold=6.0,
-                        )
-                    # Ensure the quantized layer lives on the same (CUDA) device as the original
-                    quant_layer = quant_layer.to(child.weight.device)
-                    # Copy weights and ensure proper dtype handling
-                    with torch.no_grad():
-                        # Convert weights to appropriate dtype for BitsAndBytes
-                        if use_int4:
-                            # 4-bit works with bfloat16
-                            quant_layer.weight.copy_(child.weight.detach())
-                            if bias:
-                                quant_layer.bias.copy_(child.bias.detach())
-                        else:
-                            # 8-bit Linear8bitLt requires float16, not bfloat16
-                            weight_data = child.weight.detach()
-                            if weight_data.dtype == torch.bfloat16:
-                                weight_data = weight_data.to(torch.float16)
-                            quant_layer.weight.copy_(weight_data)
-                            if bias:
-                                bias_data = child.bias.detach()
-                                if bias_data.dtype == torch.bfloat16:
-                                    bias_data = bias_data.to(torch.float16)
-                                quant_layer.bias.copy_(bias_data)
-                    setattr(module, name, quant_layer)
-            return module
-
-        print(f"[BNB] Quantizing with {'4-bit (nf4)' if use_int4 else '8-bit'} Linear layers...")
-        if "text_encoder" in models_to_quantize and hasattr(self.pipeline, "text_encoder"):
-            self.pipeline.text_encoder = replace_linear_with_bnb(self.pipeline.text_encoder)
-            print("[BNB] Text encoder quantized")
-        if "generator" in models_to_quantize and hasattr(self.pipeline, "generator"):
-            target = getattr(self.pipeline.generator, "model", self.pipeline.generator)
-            replace_linear_with_bnb(target)
-            print("[BNB] Generator quantized")
-        if "vae" in models_to_quantize and hasattr(self.pipeline, "vae"):
-            replace_linear_with_bnb(self.pipeline.vae)
-            print("[BNB] VAE linear layers quantized (if any)")
         
     def _load_generator_weights(self):
         """Load generator checkpoint"""
@@ -250,7 +150,7 @@ class PersistentInteractivePipeline:
             self.config.num_samples,
             self.config.num_output_frames, 
             16, 60, 104
-        ], device=self.device, dtype=torch.float16)
+        ], device=self.device, dtype=torch.bfloat16)
         
         # Run inference (text encoder and VAE already compiled after first run!)
         inference_start = time.perf_counter()
