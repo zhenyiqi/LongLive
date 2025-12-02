@@ -119,10 +119,42 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             self.text_encoder._compiled_forward = self.text_encoder.__call__
             self._text_encoder_compiled = False
         
-        # DON'T compile generator (causes CUDA Graphs issues)
-        self._log_timing("Skipping generator compilation (avoiding CUDA Graphs issues)")
-        self._generator_compiled = False  
-        self.generator._compiled_forward = self.generator.__call__
+        # Generator compilation strategy (no selective path)
+        # If compile_generator_cached=True, try compiling the cached path (graphs disabled, dynamic shapes).
+        # Otherwise, keep generator eager.
+        compile_generator_cached = bool(getattr(self.args, "compile_generator_cached", False))
+        if compile_generator_cached:
+            gen_comp_start = time.perf_counter()
+            self._log_timing("Compiling generator (cached path) with torch.compile (graphs off, dynamic=True)...")
+            try:
+                try:
+                    # Best-effort: avoid CUDA graph capture in Inductor
+                    if hasattr(torch, "_inductor") and hasattr(torch._inductor, "config"):
+                        try:
+                            torch._inductor.config.triton.cudagraphs = False
+                        except Exception:
+                            pass
+                        try:
+                            torch._inductor.config.capture_graphs = False
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                compiled_forward = torch.compile(
+                    self.generator.__call__,
+                    mode="reduce-overhead",
+                    fullgraph=False,
+                    dynamic=True
+                )
+                self.generator._compiled_forward = compiled_forward
+                self._generator_compiled = True
+                self._log_timing("Generator (cached path) compilation successful", (time.perf_counter() - gen_comp_start) * 1000)
+            except Exception as e:
+                self._log_timing(f"Generator (cached path) compilation failed: {e}", (time.perf_counter() - gen_comp_start) * 1000)
+                self.generator._compiled_forward = self.generator.__call__
+                self._generator_compiled = False
+        else:
+            self._log_timing("Skipping generator compilation (kept eager)")
         
         # Skip VAE compilation entirely (avoiding compilation complexity)
         self._log_timing("Skipping VAE compilation (avoiding compilation complexity)")
@@ -130,7 +162,13 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         self._vae_compiled = False
     
     def _pre_allocate_timestep_tensors(self, batch_size: int, max_frames: int, device: torch.device):
-        """Pre-allocate timestep tensors to avoid repeated allocation during inference"""
+        """Pre-allocate timestep tensors to avoid repeated allocation during inference.
+        
+        The preallocated tensors are:
+        1. _timestep_tensors
+        2. _context_timestep_tensors
+        3. _noise_timestep_tensors.
+        """
         
         # Pre-allocate timestep tensors for all denoising steps
         self._timestep_tensors = {}
@@ -293,6 +331,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         
         with torch.no_grad():
             if self.latency_tracker and COMPREHENSIVE_TIMING_AVAILABLE:
+                # (430ms)
                 with self.latency_tracker.time_component('prompt_switch_recache', 
                                                        segment_idx=segment_idx,
                                                        frame_idx=current_start_frame,
@@ -502,6 +541,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         self._set_all_modules_max_attention_size(self.local_attn_size)
 
         # temporal denoising by blocks
+        # [3, 3, ..., 3] if num_frame_per_block is 3
         all_num_frames = [self.num_frame_per_block] * num_blocks
         segment_idx = 0  # current segment index
         next_switch_pos = (

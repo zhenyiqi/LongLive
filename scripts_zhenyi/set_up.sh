@@ -22,6 +22,7 @@ conda install -c nvidia/label/cuda-12.4.1 cudatoolkit
 pip install --upgrade pip
 pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128
 pip install -r requirements.txt
+pip install -r appdirs==1.4.4
 pip install nvidia-pyindex --no-build-isolation
 pip install flash-attn --no-build-isolation
 

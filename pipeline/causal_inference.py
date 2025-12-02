@@ -177,6 +177,7 @@ class CausalInferencePipeline(torch.nn.Module):
 
                 # set current timestep
                 timestep = torch.ones(
+                    # [B, 3], if each block contains 3 frames
                     [batch_size, current_num_frames],
                     device=noise.device,
                     dtype=torch.int64) * current_timestep
