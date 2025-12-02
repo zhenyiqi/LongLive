@@ -42,4 +42,4 @@ quantization:
   enabled: true               # Enable quantization
   method: "bnb"               # Use bitsandbytes GPU quantization
   dtype: "int8"               # "int8" (Linear8bitLt) or "int4" (Linear4bit nf4)
-  models: ["generator", "text_encoder"]  # Which components to quantize
+  models: ["generator"]  # Which components to quantize
