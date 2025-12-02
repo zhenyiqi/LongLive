@@ -66,7 +66,8 @@ class PersistentInteractivePipeline:
             
         # Move to device and dtype first
         print("dtype", self.pipeline.generator.model.dtype)
-        self.pipeline = self.pipeline.to(dtype=torch.bfloat16)
+        # Use float16 for BitsAndBytes int8 compatibility
+        self.pipeline = self.pipeline.to(dtype=torch.float16)
         self.pipeline.generator.to(device=self.device)
         self.pipeline.vae.to(device=self.device)
         
@@ -135,10 +136,25 @@ class PersistentInteractivePipeline:
                         )
                     # Ensure the quantized layer lives on the same (CUDA) device as the original
                     quant_layer = quant_layer.to(child.weight.device)
+                    # Copy weights and ensure proper dtype handling
                     with torch.no_grad():
-                        quant_layer.weight.copy_(child.weight.detach())
-                        if bias:
-                            quant_layer.bias.copy_(child.bias.detach())
+                        # Convert weights to appropriate dtype for BitsAndBytes
+                        if use_int4:
+                            # 4-bit works with bfloat16
+                            quant_layer.weight.copy_(child.weight.detach())
+                            if bias:
+                                quant_layer.bias.copy_(child.bias.detach())
+                        else:
+                            # 8-bit Linear8bitLt requires float16, not bfloat16
+                            weight_data = child.weight.detach()
+                            if weight_data.dtype == torch.bfloat16:
+                                weight_data = weight_data.to(torch.float16)
+                            quant_layer.weight.copy_(weight_data)
+                            if bias:
+                                bias_data = child.bias.detach()
+                                if bias_data.dtype == torch.bfloat16:
+                                    bias_data = bias_data.to(torch.float16)
+                                quant_layer.bias.copy_(bias_data)
                     setattr(module, name, quant_layer)
             return module
 

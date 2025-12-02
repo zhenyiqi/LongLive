@@ -39,7 +39,7 @@ adapter:
 
 
 quantization:
-  enabled: true               # Enable quantization
+  enabled: true               # Enabled - now using float16 pipeline compatible with int8
   method: "bnb"               # Use bitsandbytes GPU quantization
   dtype: "int8"               # "int8" (Linear8bitLt) or "int4" (Linear4bit nf4)
   models: ["generator"]  # Which components to quantize
