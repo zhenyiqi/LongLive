@@ -59,6 +59,13 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
         # Initialize latency tracking
         self.latency_tracker = None
         self.enable_timing_logs = True
+        # Default compilation state for generator (may be updated later)
+        self._generator_compiled = False
+        try:
+            # Ensure a callable is available regardless of compilation path
+            self.generator._compiled_forward = self.generator.__call__
+        except Exception:
+            pass
         
         # Compile text encoder and VAE, but not generator (CUDA Graphs issues with KV cache)
         self._compile_safe_models_for_h100()
@@ -119,42 +126,13 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             self.text_encoder._compiled_forward = self.text_encoder.__call__
             self._text_encoder_compiled = False
         
-        # Generator compilation strategy (no selective path)
-        # If compile_generator_cached=True, try compiling the cached path (graphs disabled, dynamic shapes).
-        # Otherwise, keep generator eager.
-        compile_generator_cached = bool(getattr(self.args, "compile_generator_cached", False))
-        if compile_generator_cached:
-            gen_comp_start = time.perf_counter()
-            self._log_timing("Compiling generator (cached path) with torch.compile (graphs off, dynamic=True)...")
-            try:
-                try:
-                    # Best-effort: avoid CUDA graph capture in Inductor
-                    if hasattr(torch, "_inductor") and hasattr(torch._inductor, "config"):
-                        try:
-                            torch._inductor.config.triton.cudagraphs = False
-                        except Exception:
-                            pass
-                        try:
-                            torch._inductor.config.capture_graphs = False
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-                compiled_forward = torch.compile(
-                    self.generator.__call__,
-                    mode="reduce-overhead",
-                    fullgraph=False,
-                    dynamic=True
-                )
-                self.generator._compiled_forward = compiled_forward
-                self._generator_compiled = True
-                self._log_timing("Generator (cached path) compilation successful", (time.perf_counter() - gen_comp_start) * 1000)
-            except Exception as e:
-                self._log_timing(f"Generator (cached path) compilation failed: {e}", (time.perf_counter() - gen_comp_start) * 1000)
-                self.generator._compiled_forward = self.generator.__call__
-                self._generator_compiled = False
-        else:
-            self._log_timing("Skipping generator compilation (kept eager)")
+        # Always keep generator eager (no compile path)
+        self._log_timing("Skipping generator compilation (kept eager)")
+        self._generator_compiled = False
+        try:
+            self.generator._compiled_forward = self.generator.__call__
+        except Exception:
+            pass
         
         # Skip VAE compilation entirely (avoiding compilation complexity)
         self._log_timing("Skipping VAE compilation (avoiding compilation complexity)")
@@ -781,9 +759,9 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                                               num_frames=num_output_frames,
                                               input_shape=list(output.shape),
                                               compiled=False):
-                video = self.vae.decode_to_pixel(output_for_vae, use_cache=False)
+                video = self.vae._compiled_decode(output_for_vae, use_cache=False)
         else:
-            video = self.vae.decode_to_pixel(output_for_vae, use_cache=False)
+            video = self.vae._compiled_decode(output_for_vae, use_cache=False)
         
         # End VAE decode timing - pure decode time only
         vae_decode_time = (time.perf_counter() - vae_decode_start) * 1000
