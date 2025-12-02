@@ -367,6 +367,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                                                    segment_idx=i, 
                                                    num_prompts=len(prompts),
                                                    compiled=self._text_encoder_compiled):
+                    torch.compiler.cudagraph_mark_step_begin()
                     cond_list.append(self.text_encoder._compiled_forward(text_prompts=prompts))
                 encoding_time = (time.perf_counter() - encoding_start) * 1000
                 self._log_timing(f"Segment {i} encoded", encoding_time)
@@ -374,6 +375,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
             cond_list = []
             for i, prompts in enumerate(text_prompts_list):
                 encoding_start = time.perf_counter()
+                torch.compiler.cudagraph_mark_step_begin()
                 cond_list.append(self.text_encoder._compiled_forward(text_prompts=prompts))
                 encoding_time = (time.perf_counter() - encoding_start) * 1000
                 self._log_timing(f"Segment {i} encoded", encoding_time)
@@ -492,6 +494,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                                                           segment_idx=segment_idx,
                                                           is_final_step=False,
                                                           compiled=self._generator_compiled):
+                            torch.compiler.cudagraph_mark_step_begin()
                             _, denoised_pred = self.generator._compiled_forward(
                                 noisy_image_or_video=noisy_input,
                                 conditional_dict=cond_in_use,
@@ -501,6 +504,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                                 current_start=current_start_frame * self.frame_seq_length,
                             )
                     else:
+                        torch.compiler.cudagraph_mark_step_begin()
                         _, denoised_pred = self.generator._compiled_forward(
                             noisy_image_or_video=noisy_input,
                             conditional_dict=cond_in_use,
@@ -531,6 +535,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                                                           segment_idx=segment_idx,
                                                           is_final_step=True,
                                                           compiled=self._generator_compiled):
+                            torch.compiler.cudagraph_mark_step_begin()
                             _, denoised_pred = self.generator._compiled_forward(
                                 noisy_image_or_video=noisy_input,
                                 conditional_dict=cond_in_use,
@@ -540,6 +545,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                                 current_start=current_start_frame * self.frame_seq_length,
                             )
                     else:
+                        torch.compiler.cudagraph_mark_step_begin()
                         _, denoised_pred = self.generator._compiled_forward(
                             noisy_image_or_video=noisy_input,
                             conditional_dict=cond_in_use,
@@ -568,6 +574,7 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                                   segment_idx=segment_idx,
                                   context_noise=self.args.context_noise,
                                   compiled=self._generator_compiled):
+                torch.compiler.cudagraph_mark_step_begin()
                 self.generator._compiled_forward(
                     noisy_image_or_video=denoised_pred,
                     conditional_dict=cond_in_use,
