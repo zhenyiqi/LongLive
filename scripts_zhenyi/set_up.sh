@@ -19,7 +19,7 @@ conda activate longlive
 #
 conda install nvidia/label/cuda-12.4.1::cuda
 conda install -c nvidia/label/cuda-12.4.1 cudatoolkit
-pip install --upgrade
+pip install --upgrade pip
 pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128
 pip install -r requirements.txt
 pip install nvidia-pyindex --no-build-isolation
@@ -29,3 +29,6 @@ pip install flash-attn --no-build-isolation
 pip install huggingface_hub
 hf download Wan-AI/Wan2.1-T2V-1.3B --local-dir wan_models/Wan2.1-T2V-1.3B
 hf download Efficient-Large-Model/LongLive --local-dir longlive_models
+
+sudo apt update && sudo apt install tmux
+sudo apt install neovim
