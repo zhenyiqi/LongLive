@@ -476,23 +476,26 @@ class RealTimeStreamingPipeline:
                     cache_shape = self.base_pipeline.kv_cache1[0]["k"].shape
                     print(f"[RealTime] Cache shape before generation at frame {start_frame}: {cache_shape}")
                     
-                if start_frame == 0:
+                # After a prompt switch, start caching from 0 to avoid index mismatch
+                cache_start_frame = 0 if self._force_per_frame else start_frame
+                
+                if cache_start_frame == 0:
                     return self.base_pipeline._generate_block(
                         noise=noise_block,
                         prompt_embeds=encoded_prompt,
-                        start_frame=start_frame
+                        start_frame=cache_start_frame
                     )
                 else:
                     return self.base_pipeline._generate_block_with_cache(
                         noise=noise_block,
                         prompt_embeds=encoded_prompt,
-                        start_frame=start_frame
+                        start_frame=cache_start_frame
                     )
             
             def generate_per_frame() -> torch.Tensor:
                 per_frame_latents = []
                 for offset in range(block_size):
-                    cur_start = start_frame + offset
+                    cur_start = (0 if self._force_per_frame else start_frame) + offset
                     noise_single = noise_block[:, offset:offset + 1]
                     if cur_start == 0:
                         lat_single = self.base_pipeline._generate_block(
