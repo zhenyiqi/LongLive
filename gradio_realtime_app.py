@@ -37,11 +37,13 @@ class GradioVideoStreamer:
     def __init__(self, config_path: str):
         self.pipeline = RealTimeStreamingPipeline(config_path)
         self.video_frames = deque(maxlen=160)  # ~10 seconds at 16fps
-        self.display_queue = deque(maxlen=512)  # buffered frames for paced UI consumption
+        # Increase buffered queue to absorb bursts and higher decode throughput
+        self.display_queue = deque(maxlen=4096)  # buffered frames for paced UI consumption
         self.frame_lock = threading.Lock()
         self.last_display_time = 0.0
         self.last_display_frame = None
-        self.target_interval_s = 0.25  # 4 fps cadence for UI
+        # Refresh faster (~12 fps) to drain the queue more aggressively
+        self.target_interval_s = (1.0 / 12.0)
         
         # Setup pipeline callback
         self.pipeline.add_frame_callback(self._frame_callback)
@@ -248,7 +250,7 @@ def update_display():
         return None, "❌ Not initialized"
     
     try:
-        frame = streamer.get_next_frame_for_interval(0.25)
+        frame = streamer.get_next_frame_for_interval(1.0 / 12.0)
         status = streamer.get_status()
         queue_size = streamer.get_display_queue_size()
         
@@ -380,8 +382,8 @@ def create_interface():
             outputs=[result_display, video_frame, status_display]
         )
         
-        # Server-side timer to update display every 0.25s (4 fps)
-        refresh_timer = gr.Timer(0.25)
+        # Server-side timer to update display ~every 1/12s (~12 fps)
+        refresh_timer = gr.Timer(1.0 / 12.0)
         refresh_timer.tick(
             update_display,
             outputs=[video_frame, status_display]
