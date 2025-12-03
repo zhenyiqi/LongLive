@@ -339,10 +339,10 @@ def create_interface():
         with gr.Accordion("ℹ️ How to Use", open=False):
             gr.Markdown("""
             ### 🎯 Quick Start:
-            1. **Initialize**: Click "Initialize App" (do this first!)
+            1. **Initialize**: wait till the status says "✅ App initialized! Ready to generate videos." (~1 minute)
             2. **Start**: Enter prompt and click "Start Video"
             3. **Switch**: Enter new prompts and click "Send Prompt" 
-            4. **New Video**: After 60 seconds, click "New Video" to start fresh
+            4. **New Video**: After the video is finished, click "New Video" to start fresh
             
             ### ✨ Features:
             - **Real-time generation**: See frames as they're created
