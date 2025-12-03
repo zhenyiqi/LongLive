@@ -145,6 +145,12 @@ class RealTimeStreamingPipeline:
             kv_cache_size = local_attn_cfg * self.base_pipeline.frame_seq_length
         else:
             kv_cache_size = self.total_frames * self.base_pipeline.frame_seq_length
+            
+        print(f"[RealTime] Cache config: local_attn_cfg={local_attn_cfg}, frame_seq_length={self.base_pipeline.frame_seq_length}")
+        print(f"[RealTime] Calculated kv_cache_size={kv_cache_size}")
+        print(f"[RealTime] Model local_attn_size={getattr(self.base_pipeline.generator.model, 'local_attn_size', 'Not set')}")
+        print(f"[RealTime] Pipeline local_attn_size={getattr(self.base_pipeline, 'local_attn_size', 'Not set')}")
+        
         # Fresh caches
         self.base_pipeline._initialize_kv_cache(
             batch_size=1,
@@ -152,6 +158,11 @@ class RealTimeStreamingPipeline:
             device=self.device,
             kv_cache_size_override=kv_cache_size
         )
+        
+        # Debug: Check cache dimensions after initialization
+        if self.base_pipeline.kv_cache1:
+            cache_shape = self.base_pipeline.kv_cache1[0]["k"].shape
+            print(f"[RealTime] KV cache initialized with shape: {cache_shape}")
         self.base_pipeline._initialize_crossattn_cache(
             batch_size=1,
             dtype=torch.bfloat16,
@@ -400,9 +411,13 @@ class RealTimeStreamingPipeline:
         
         if not global_sink:
             # Reset KV cache (using fill_ to preserve dimensions)
-            for cache_entry in self.base_pipeline.kv_cache1:
+            for i, cache_entry in enumerate(self.base_pipeline.kv_cache1):
+                k_shape_before = cache_entry["k"].shape
                 cache_entry["k"].fill_(0.0)
                 cache_entry["v"].fill_(0.0)
+                k_shape_after = cache_entry["k"].shape
+                print(f"[RealTime] Cache {i}: shape before={k_shape_before}, after={k_shape_after}")
+                
                 # Reset index pointers if they exist
                 if "global_end_index" in cache_entry:
                     cache_entry["global_end_index"].fill_(0)
@@ -437,6 +452,11 @@ class RealTimeStreamingPipeline:
             
             # Prefer fast block generation; fallback to per-frame if a switch just happened or if a mismatch occurs
             def generate_blockwise() -> torch.Tensor:
+                # Debug cache shape before generation
+                if self.base_pipeline.kv_cache1:
+                    cache_shape = self.base_pipeline.kv_cache1[0]["k"].shape
+                    print(f"[RealTime] Cache shape before generation at frame {start_frame}: {cache_shape}")
+                    
                 if start_frame == 0:
                     return self.base_pipeline._generate_block(
                         noise=noise_block,
@@ -483,8 +503,8 @@ class RealTimeStreamingPipeline:
                         print(f"[RealTime] Blockwise generation failed, falling back to per-frame: {e}")
                         latents = generate_per_frame()
             
-            # Update KV cache with context timestep for next block (optional; skip if low memory)
-            self._maybe_update_kv_context(latents, encoded_prompt, start_frame, block_size)
+            # Temporarily disable KV context update to avoid cache corruption
+            print("[RealTime] Skipping KV context update to avoid cache corruption")
             
             # Append latents to history for potential recache
             try:
