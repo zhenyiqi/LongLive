@@ -63,8 +63,10 @@ class RealTimeStreamingPipeline:
         # Video parameters
         # Read fps from config if provided; fall back to 16
         self.fps = int(getattr(self.config, "fps", 16))
-        # Use config-provided total frames (e.g., 240). Derive duration from fps.
-        self.total_frames = int(getattr(self.config, "num_output_frames", 960))
+        # Latent frames requested by config (e.g., 240)
+        self.total_latent_frames = int(getattr(self.config, "num_output_frames", 240))
+        # Assume at most 4x temporal upsampling in VAE → video frame cap
+        self.total_frames = self.total_latent_frames * 4  # total video frames target
         self.duration_seconds = self.total_frames / self.fps
         self.block_size = self.config.num_frame_per_block  # Typically 3
         
@@ -95,9 +97,9 @@ class RealTimeStreamingPipeline:
         self.frame_callbacks: List[Callable[[np.ndarray, int], None]] = []
         self.latest_frame = None
         
-        # Pre-allocated noise for entire video
+        # Pre-allocated noise for entire video (latent frames count)
         self.noise = torch.randn([
-            1, self.total_frames, 16, 60, 104
+            1, self.total_latent_frames, 16, 60, 104
         ], device=self.device, dtype=torch.bfloat16)
         
         print(f"[RealTime] Pipeline initialized for {self.duration_seconds}s video ({self.total_frames} frames)")
@@ -146,7 +148,8 @@ class RealTimeStreamingPipeline:
         if local_attn_cfg != -1:
             kv_cache_size = local_attn_cfg * self.base_pipeline.frame_seq_length
         else:
-            kv_cache_size = self.total_frames * self.base_pipeline.frame_seq_length
+            # For global attention, cache size must cover all latent tokens
+            kv_cache_size = self.total_latent_frames * self.base_pipeline.frame_seq_length
             
         print(f"[RealTime] Cache config: local_attn_cfg={local_attn_cfg}, frame_seq_length={self.base_pipeline.frame_seq_length}")
         print(f"[RealTime] Calculated kv_cache_size={kv_cache_size}")
@@ -318,7 +321,7 @@ class RealTimeStreamingPipeline:
             self._initialize_cache_state()
             
             # Generate blocks continuously
-            while self.is_running and self.current_frame < self.total_frames:
+            while self.is_running and self.latent_frame_cursor < self.total_latent_frames and self.current_frame < self.total_frames:
                 # Check for prompt switches
                 if self._check_and_apply_prompt_switch():
                     # Re-encode new prompt
@@ -335,8 +338,8 @@ class RealTimeStreamingPipeline:
                 
                 # Generate next block
                 block_start = self.latent_frame_cursor
-                block_end = block_start + self.block_size
-                actual_block_size = self.block_size
+                remaining_latents = max(0, self.total_latent_frames - block_start)
+                actual_block_size = min(self.block_size, remaining_latents)
                 
                 if actual_block_size > 0:
                     self._generate_and_stream_block(
