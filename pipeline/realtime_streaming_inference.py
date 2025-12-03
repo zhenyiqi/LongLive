@@ -80,6 +80,8 @@ class RealTimeStreamingPipeline:
         self.current_frame = 0
         self.current_prompt = ""
         self.start_time = None
+        # Track latent-frame position separately from video frames streamed
+        self.latent_frame_cursor = 0
         # Keep recent latents to support recache on prompt switch (store all up to total_frames)
         from collections import deque
         self._latents_history = deque(maxlen=int(self.total_frames))
@@ -205,7 +207,8 @@ class RealTimeStreamingPipeline:
             
         print(f"[RealTime] Starting generation with prompt: '{initial_prompt}'")
         self.current_prompt = initial_prompt
-        self.current_frame = 0
+        self.current_frame = 0            # video frame cursor
+        self.latent_frame_cursor = 0      # latent frame cursor
         self.start_time = time.time()
         self.is_running = True
         
@@ -234,6 +237,7 @@ class RealTimeStreamingPipeline:
             
         # Reset state variables
         self.current_frame = 0
+        self.latent_frame_cursor = 0
         self.current_prompt = ""
         self.start_time = None
         
@@ -274,9 +278,9 @@ class RealTimeStreamingPipeline:
             print(f"[RealTime] Prompt unchanged - skipping switch: '{prompt[:50]}...'")
             return False
             
-        # Calculate the target frame for this switch (current + small buffer)
-        buffer_frames = max(1, self.block_size)  # Minimum buffer for smooth switching
-        target_frame = self.current_frame + buffer_frames
+        # Calculate the target latent frame for this switch (latent_cursor + small buffer)
+        buffer_frames = max(1, self.block_size)
+        target_frame = self.latent_frame_cursor + buffer_frames
         
         switch_event = PromptSwitchEvent(
             prompt=prompt,
@@ -324,22 +328,23 @@ class RealTimeStreamingPipeline:
                     try:
                         self._recache_after_switch(
                             prompt_embeds=current_encoded_prompt,
-                            current_start_frame=self.current_frame
+                            current_start_frame=self.latent_frame_cursor
                         )
                     except Exception as e:
                         print(f"[RealTime] Recache step failed (continuing): {e}")
                 
                 # Generate next block
-                block_start = self.current_frame
-                block_end = min(self.current_frame + self.block_size, self.total_frames)
-                actual_block_size = block_end - block_start
+                block_start = self.latent_frame_cursor
+                block_end = block_start + self.block_size
+                actual_block_size = self.block_size
                 
                 if actual_block_size > 0:
                     self._generate_and_stream_block(
                         block_start, actual_block_size, current_encoded_prompt
                     )
-                    
-                    # current_frame is advanced inside _generate_and_stream_block
+                    # current_frame (video) is advanced inside _generate_and_stream_block
+                    # Advance latent cursor by number of latent frames generated
+                    self.latent_frame_cursor += actual_block_size
                 
                 # Do not stop based on wall-clock time; stop by total_frames only
                     
@@ -379,11 +384,11 @@ class RealTimeStreamingPipeline:
             while not self.prompt_switch_queue.empty():
                 switch_event = self.prompt_switch_queue.get_nowait()
                 
-                if self.current_frame >= switch_event.target_frame:
+                if self.latent_frame_cursor >= switch_event.target_frame:
                     # Apply switch immediately
                     old_prompt = self.current_prompt
                     self.current_prompt = switch_event.prompt
-                    print(f"[RealTime] Prompt switched at frame {self.current_frame}")
+                    print(f"[RealTime] Prompt switched at latent frame {self.latent_frame_cursor} (video frame {self.current_frame})")
                     print(f"  From: '{old_prompt[:30]}...'")
                     print(f"  To:   '{self.current_prompt[:30]}...'")
                     
@@ -440,8 +445,19 @@ class RealTimeStreamingPipeline:
     
     def _reset_cache_for_first_block(self):
         """Reset cache state for first block generation"""
-        # Use the same cache clearing approach but for first block
-        self._clear_cache_for_switch()
+        # Reset KV cache entries (content and indices)
+        for cache_entry in self.base_pipeline.kv_cache1:
+            cache_entry["k"].fill_(0.0)
+            cache_entry["v"].fill_(0.0)
+            if "global_end_index" in cache_entry:
+                cache_entry["global_end_index"].fill_(0)
+            if "local_end_index" in cache_entry:
+                cache_entry["local_end_index"].fill_(0)
+        # Reset cross-attention cache
+        for cache_entry in self.base_pipeline.crossattn_cache:
+            cache_entry["k"].fill_(0.0)
+            cache_entry["v"].fill_(0.0)
+            cache_entry["is_init"] = False
         print("[RealTime] Cache reset for first block")
                 
     def _generate_and_stream_block(self, start_frame: int, block_size: int, encoded_prompt: torch.Tensor):
