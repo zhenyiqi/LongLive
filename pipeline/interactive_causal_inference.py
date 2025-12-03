@@ -188,6 +188,100 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                 dtype=torch.long
             )
             
+    def _generate_block(self, noise: torch.Tensor, prompt_embeds: torch.Tensor, start_frame: int) -> torch.Tensor:
+        """Generate a single block of frames without cache (for first block)"""
+        batch_size, num_frames = noise.shape[:2]
+        
+        # Text encoding
+        conditional_dict = {"prompt_embeds": prompt_embeds}
+        
+        # Denoising loop
+        noisy_input = noise
+        for index, current_timestep in enumerate(self.denoising_step_list):
+            timestep_key = int(current_timestep.item()) if hasattr(current_timestep, 'item') else int(current_timestep)
+            timestep = self._timestep_tensors[timestep_key][:batch_size, :num_frames]
+            
+            if index < len(self.denoising_step_list) - 1:
+                # Intermediate step
+                _, denoised_pred = self.generator._compiled_forward(
+                    noisy_image_or_video=noisy_input,
+                    conditional_dict=conditional_dict,
+                    timestep=timestep,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=start_frame * self.frame_seq_length
+                )
+                
+                # Add noise for next step
+                next_timestep = self.denoising_step_list[index + 1]
+                next_timestep_key = int(next_timestep.item()) if hasattr(next_timestep, 'item') else int(next_timestep)
+                noise_timestep = self._noise_timestep_tensors[next_timestep_key][:batch_size * num_frames]
+                
+                noisy_input = self.scheduler.add_noise(
+                    denoised_pred.flatten(0, 1),
+                    torch.randn_like(denoised_pred.flatten(0, 1)),
+                    noise_timestep
+                ).unflatten(0, (batch_size, num_frames))
+            else:
+                # Final step
+                _, denoised_pred = self.generator._compiled_forward(
+                    noisy_image_or_video=noisy_input,
+                    conditional_dict=conditional_dict,
+                    timestep=timestep,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=start_frame * self.frame_seq_length
+                )
+        
+        return denoised_pred
+        
+    def _generate_block_with_cache(self, noise: torch.Tensor, prompt_embeds: torch.Tensor, start_frame: int) -> torch.Tensor:
+        """Generate a block of frames using KV cache (for subsequent blocks)"""
+        batch_size, num_frames = noise.shape[:2]
+        
+        # Text encoding
+        conditional_dict = {"prompt_embeds": prompt_embeds}
+        
+        # Denoising loop with cache
+        noisy_input = noise
+        for index, current_timestep in enumerate(self.denoising_step_list):
+            timestep_key = int(current_timestep.item()) if hasattr(current_timestep, 'item') else int(current_timestep)
+            timestep = self._timestep_tensors[timestep_key][:batch_size, :num_frames]
+            
+            if index < len(self.denoising_step_list) - 1:
+                # Intermediate step with cache
+                _, denoised_pred = self.generator._compiled_forward(
+                    noisy_image_or_video=noisy_input,
+                    conditional_dict=conditional_dict,
+                    timestep=timestep,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=start_frame * self.frame_seq_length
+                )
+                
+                # Add noise for next step
+                next_timestep = self.denoising_step_list[index + 1]
+                next_timestep_key = int(next_timestep.item()) if hasattr(next_timestep, 'item') else int(next_timestep)
+                noise_timestep = self._noise_timestep_tensors[next_timestep_key][:batch_size * num_frames]
+                
+                noisy_input = self.scheduler.add_noise(
+                    denoised_pred.flatten(0, 1),
+                    torch.randn_like(denoised_pred.flatten(0, 1)),
+                    noise_timestep
+                ).unflatten(0, (batch_size, num_frames))
+            else:
+                # Final step with cache
+                _, denoised_pred = self.generator._compiled_forward(
+                    noisy_image_or_video=noisy_input,
+                    conditional_dict=conditional_dict,
+                    timestep=timestep,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=start_frame * self.frame_seq_length
+                )
+        
+        return denoised_pred
+            
     def _log_timing(self, message: str, elapsed_ms: float = None):
         """Log timing information"""
         if self.enable_timing_logs:

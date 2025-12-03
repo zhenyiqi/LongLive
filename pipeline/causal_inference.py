@@ -578,10 +578,20 @@ class CausalInferencePipeline(torch.nn.Module):
                 # Global attention: default cache for 21 frames (backward compatibility)
                 kv_cache_size = 32760
 
+        # Derive head configuration from the actual model to avoid mismatches
+        try:
+            num_heads = int(getattr(self.generator.model, "num_heads"))
+            model_dim = int(getattr(self.generator.model, "dim"))
+            head_dim = model_dim // num_heads
+        except Exception:
+            # Fallback to commonly used values
+            num_heads = 12
+            head_dim = 128
+
         for _ in range(self.num_transformer_blocks):
             kv_cache1.append({
-                "k": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
-                "v": torch.zeros([batch_size, kv_cache_size, 12, 128], dtype=dtype, device=device),
+                "k": torch.zeros([batch_size, kv_cache_size, num_heads, head_dim], dtype=dtype, device=device),
+                "v": torch.zeros([batch_size, kv_cache_size, num_heads, head_dim], dtype=dtype, device=device),
                 "global_end_index": torch.tensor([0], dtype=torch.long, device=device),
                 "local_end_index": torch.tensor([0], dtype=torch.long, device=device)
             })
@@ -594,10 +604,19 @@ class CausalInferencePipeline(torch.nn.Module):
         """
         crossattn_cache = []
 
+        # Align cross-attention cache with model head configuration
+        try:
+            num_heads = int(getattr(self.generator.model, "num_heads"))
+            model_dim = int(getattr(self.generator.model, "dim"))
+            head_dim = model_dim // num_heads
+        except Exception:
+            num_heads = 12
+            head_dim = 128
+
         for _ in range(self.num_transformer_blocks):
             crossattn_cache.append({
-                "k": torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
-                "v": torch.zeros([batch_size, 512, 12, 128], dtype=dtype, device=device),
+                "k": torch.zeros([batch_size, 512, num_heads, head_dim], dtype=dtype, device=device),
+                "v": torch.zeros([batch_size, 512, num_heads, head_dim], dtype=dtype, device=device),
                 "is_init": False
             })
         self.crossattn_cache = crossattn_cache

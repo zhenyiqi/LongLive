@@ -1,0 +1,10 @@
+# Real-time Video Generation App Requirements
+streamlit>=1.28.0
+opencv-python>=4.8.0
+Pillow>=10.0.0
+numpy>=1.24.0
+
+# Existing project requirements (add to main requirements.txt if needed)
+torch>=2.0.0
+torchvision>=0.15.0
+omegaconf>=2.3.0
