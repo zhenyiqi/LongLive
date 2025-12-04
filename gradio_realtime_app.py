@@ -25,7 +25,7 @@ parent_dir = os.path.dirname(os.path.abspath(__file__))
 if parent_dir not in sys.path:
     sys.path.append(parent_dir)
 
-from pipeline.realtime_streaming_inference_v2 import RealTimeStreamingPipelineV2
+from pipeline.realtime_streaming_inference import RealTimeStreamingPipeline
 
 
 class GradioVideoStreamer:
@@ -35,7 +35,7 @@ class GradioVideoStreamer:
     """
     
     def __init__(self, config_path: str):
-        self.pipeline = RealTimeStreamingPipelineV2(config_path)
+        self.pipeline = RealTimeStreamingPipeline(config_path)
         self.video_frames = deque(maxlen=160)  # ~10 seconds at 16fps
         # Increase buffered queue to absorb bursts and higher decode throughput
         self.display_queue = deque(maxlen=8192)  # buffered frames for paced UI consumption
@@ -48,7 +48,7 @@ class GradioVideoStreamer:
         # Setup pipeline callback
         self.pipeline.add_frame_callback(self._frame_callback)
         
-        print("[Gradio] Video streamer initialized with RealTimeStreamingPipelineV2!")
+        print("[Gradio] Video streamer initialized with RealTimeStreamingPipeline!")
         
     def _frame_callback(self, frame: np.ndarray, frame_idx: int):
         """Callback to receive frames from pipeline"""
