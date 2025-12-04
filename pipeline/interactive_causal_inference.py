@@ -648,6 +648,11 @@ class InteractiveCausalInferencePipeline(CausalInferencePipeline):
                 )
                 self._log_timing(f"Now using segment {segment_idx}: {text_prompts_list[segment_idx]}")
                 
+                # OPTIMIZATION: Generate only 1 frame for switch block to reduce latency
+                current_num_frames = 1
+                if DEBUG:
+                    print(f"[MultipleSwitch] Reduced block size to 1 frame for prompt switch at frame {current_start_frame}")
+                
             cond_in_use = cond_list[segment_idx]
 
             # Start block timing
