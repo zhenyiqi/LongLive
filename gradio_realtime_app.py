@@ -184,64 +184,6 @@ def initialize_app():
         return f"❌ Initialization failed: {e}"
 
 
-def start_video(prompt):
-    """Start video generation"""
-    print(f"[Gradio] start_video called with prompt: '{prompt}'")
-    print(f"[Gradio] streamer is None: {streamer is None}")
-    
-    if streamer is None:
-        return "❌ App not initialized - click 'Initialize App' first!", None, "❌ Not initialized"
-    
-    try:
-        result = streamer.start_generation(prompt)
-        status = streamer.get_status()
-        frame = streamer.get_latest_frame_for_display()
-        print(f"[Gradio] start_video result: {result}")
-        return result, frame, status
-    except Exception as e:
-        print(f"[Gradio] start_video error: {e}")
-        return f"❌ Error: {e}", None, "❌ Error"
-
-
-def send_prompt_during_generation(prompt):
-    """Send prompt during generation"""
-    print(f"[Gradio] send_prompt called with prompt: '{prompt}'")
-    print(f"[Gradio] streamer is None: {streamer is None}")
-    
-    if streamer is None:
-        return "❌ App not initialized - click 'Initialize App' first!", None, "❌ Not initialized"
-        
-    try:
-        result = streamer.send_prompt(prompt)
-        status = streamer.get_status()
-        frame = streamer.get_latest_frame_for_display()
-        print(f"[Gradio] send_prompt result: {result}")
-        return result, frame, status
-    except Exception as e:
-        print(f"[Gradio] send_prompt error: {e}")
-        return f"❌ Error: {e}", None, "❌ Error"
-
-
-def create_new_video(prompt):
-    """Create new video after completion"""
-    if streamer is None:
-        return "❌ App not initialized", None, "❌ Error"
-        
-    result = streamer.new_video(prompt)
-    status = streamer.get_status()
-    frame = streamer.get_latest_frame_for_display()
-    return result, frame, status
-
-
-def stop_video():
-    """Stop current generation"""
-    if streamer is None:
-        return "❌ App not initialized", None, "❌ Error"
-        
-    result = streamer.stop_generation()
-    status = streamer.get_status()
-    frame = streamer.get_latest_frame_for_display()
-    return result, frame, status
 
 
 def update_display():
@@ -272,117 +214,67 @@ def update_display():
         return None, f"❌ Update error: {e}"
 
 
-def create_interface():
-    """Create Gradio interface"""
+def smart_submit(prompt):
+    """Smart submit - starts new video or switches prompt based on current state"""
+    if streamer is None:
+        return "❌ App not initialized", None, "❌ Not initialized"
     
-    with gr.Blocks(
-        title="🎬 Real-Time Interactive Video Generation"
-    ) as app:
+    if not prompt.strip():
+        return "❌ Please enter a prompt!", None, streamer.get_status()
+    
+    try:
+        # If not running or finished, start new video
+        if not streamer.pipeline.is_running or streamer.pipeline.is_finished():
+            result = streamer.new_video(prompt)
+        else:
+            # If running, switch prompt
+            result = streamer.send_prompt(prompt)
         
-        # Header
-        gr.Markdown("""
-        # 🎬 Real-Time Interactive Video Generation
+        status = streamer.get_status()
+        frame = streamer.get_latest_frame_for_display()
+        return result, frame, status
+    except Exception as e:
+        return f"❌ Error: {e}", None, "❌ Error"
+
+
+def create_interface():
+    """Create simplified Gradio interface"""
+    
+    with gr.Blocks(title="Real-Time Video Generation") as app:
         
-        **Generate videos in real-time with dynamic prompt switching!**
-        - Start with your first prompt
-        - Switch prompts anytime during generation  
-        - Each video lasts the configured number of frames
-        - Create unlimited videos
-        """)
-        
-        # Auto-initialize on page load (no button UI)
+        # Auto-initialize on page load
         app.load(initialize_app)
         
-        gr.Markdown("---")
+        # Video display
+        video_frame = gr.Image(
+            label="Generated Video",
+            type="numpy"
+        )
         
-        # Main interface
-        with gr.Row():
-            # Left column - Video display
-            with gr.Column():
-                gr.Markdown("## 📺 Live Video Generation")
-                
-                video_frame = gr.Image(
-                    label="Generated Video",
-                    type="numpy"
-                )
-                
-                status_display = gr.Textbox(
-                    label="Status",
-                    value="⏳ Ready to start",
-                    interactive=False
-                )
-                
-            # Right column - Controls
-            with gr.Column():
-                gr.Markdown("## 🎛️ Controls")
-                
-                prompt_input = gr.Textbox(
-                    label="Enter Your Prompt",
-                    placeholder="A majestic eagle soaring over snow-capped mountains",
-                    lines=3
-                )
-                
-                # Action buttons
-                with gr.Row():
-                    start_btn = gr.Button("🚀 Start Video")
-                    send_btn = gr.Button("📤 Send Prompt")
-                
-                with gr.Row():
-                    new_btn = gr.Button("🎬 New Video")
-                    stop_btn = gr.Button("⏹️ Stop")
-                
-                result_display = gr.Textbox(
-                    label="Result",
-                    value="Ready to start...",
-                    interactive=False
-                )
+        # Text input
+        prompt_input = gr.Textbox(
+            label="Enter Your Prompt",
+            placeholder="A majestic eagle soaring over snow-capped mountains",
+            lines=2
+        )
         
-        # Info section
-        with gr.Accordion("ℹ️ How to Use", open=False):
-            gr.Markdown("""
-            ### 🎯 Quick Start:
-            1. **Initialize**: wait till the status says "✅ App initialized! Ready to generate videos." (~1 minute)
-            2. **Start**: Enter prompt and click "Start Video"
-            3. **Switch**: Enter new prompts and click "Send Prompt" 
-            4. **New Video**: After the video is finished, click "New Video" to start fresh
-            
-            ### ✨ Features:
-            - **Real-time generation**: See frames as they're created
-            - **Instant switching**: Change content mid-generation
-            - **1-minute videos**: Automatic stop after 60 seconds
-            - **Unlimited videos**: Create as many as you want
-            
-            ### 💡 Tips:
-            - Be descriptive in your prompts for best results
-            - Switching prompts may cause brief visual transitions
-            - Each video generates 960 frames (16fps × 60s)
-            """)
+        # Submit button
+        submit_btn = gr.Button("Submit", variant="primary")
+        
+        # Status (hidden from user but needed for updates)
+        status_display = gr.Textbox(
+            label="Status",
+            visible=False
+        )
         
         # Event handlers
-        start_btn.click(
-            start_video,
+        submit_btn.click(
+            smart_submit,
             inputs=[prompt_input],
-            outputs=[result_display, video_frame, status_display]
+            outputs=[status_display, video_frame, status_display]
         )
         
-        send_btn.click(
-            send_prompt_during_generation,
-            inputs=[prompt_input],
-            outputs=[result_display, video_frame, status_display]
-        )
-        
-        new_btn.click(
-            create_new_video,
-            inputs=[prompt_input],
-            outputs=[result_display, video_frame, status_display]
-        )
-        
-        stop_btn.click(
-            stop_video,
-            outputs=[result_display, video_frame, status_display]
-        )
-        
-        # Server-side timer to update display ~every 1/20s (~20 fps)
+        # Auto-refresh timer for video frames
         refresh_timer = gr.Timer(1.0 / 20.0)
         refresh_timer.tick(
             update_display,
