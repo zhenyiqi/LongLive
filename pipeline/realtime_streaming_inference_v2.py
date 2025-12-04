@@ -9,22 +9,20 @@ Based closely on InteractiveCausalInferencePipeline with key differences:
 """
 
 import torch
-import torch.nn as nn
 import time
 import threading
 import queue
-from typing import List, Optional, Dict, Callable, Tuple
+from typing import List, Optional, Callable
 from dataclasses import dataclass
 from omegaconf import OmegaConf
 import numpy as np
-from collections import deque
 import os
 
 # Set PyTorch CUDA memory allocator to use expandable segments to reduce fragmentation
 os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
 from utils.misc import set_seed
-from utils.memory import get_cuda_free_memory_gb
+ 
 
 # Direct imports for pipeline components
 from pipeline.causal_inference import CausalInferencePipeline
@@ -99,13 +97,10 @@ class RealTimeStreamingPipelineV2:
             1, self.total_frames, 16, 60, 104
         ], device=self.device, dtype=torch.bfloat16)
         
-        # Output tensor - use CPU if low_memory is enabled (like InteractiveCausalInferencePipeline)
-        output_device = torch.device('cpu') if getattr(self.config, 'low_memory', False) else self.device
-        self.output = torch.zeros([
-            1, self.total_frames, 16, 60, 104
-        ], device=output_device, dtype=torch.bfloat16)
+        # Defer output allocation to generation loop
+        self.output = None
         
-        print(f"[RealTimeV2] Allocated noise on {self.noise.device}, output on {self.output.device}")
+        print(f"[RealTimeV2] Allocated noise on {self.noise.device}")
         
         print(f"[RealTimeV2] Pipeline initialized for {self.duration_seconds}s video ({self.total_frames} frames)")
         
@@ -118,25 +113,22 @@ class RealTimeStreamingPipelineV2:
         if getattr(self.config, 'generator_ckpt', None):
             self._load_generator_weights()
         
-        # Match working pipelines: set dtype/device BEFORE applying LoRA
+        # Match interactive behavior: set dtype/device presets before LoRA
         try:
             self.pipeline = self.pipeline.to(dtype=torch.bfloat16)
             self.pipeline.generator.to(device=self.device)
             self.pipeline.vae.to(device=self.device)
-            # Sweep for any lingering FP32 params/buffers (e.g., Conv3d.bias) and convert to BF16
-            for module in self.pipeline.generator.modules():
-                for p in module.parameters(recurse=False):
-                    if p is not None and p.dtype == torch.float32:
-                        p.data = p.data.to(torch.bfloat16)
-                for name, b in module.named_buffers(recurse=False):
-                    if b is not None and b.dtype == torch.float32:
-                        setattr(module, name, b.to(torch.bfloat16))
         except Exception as e:
             print(f"[RealTimeV2] Warning: dtype/device preset failed: {e}")
         
         # Setup LoRA if needed
         if getattr(self.config, 'adapter', None):
             self._setup_lora()
+            # Post-LoRA: recast generator to bf16 on target device (minimal safety, matches interactive intent)
+            try:
+                self.pipeline.generator.to(dtype=torch.bfloat16, device=self.device)
+            except Exception:
+                pass
             
         # Initialize caches and other components (like InteractiveCausalInferencePipeline)
         self._initialize_additional_components()
@@ -197,24 +189,26 @@ class RealTimeStreamingPipelineV2:
         self._block_mask_cache = {}
         self._prefetch_stream = torch.cuda.Stream(device=self.device) if torch.cuda.is_available() else None
         self._prefetch_cache = None
-        
-        # (dtype/device already aligned in _setup_pipeline_direct before LoRA)
-        
+
         # Set up compiled forward method
         self._generator_compiled = False
         try:
             self.pipeline.generator._compiled_forward = self.pipeline.generator.__call__
         except Exception:
             pass
-            
+
         # Compile safe models (text encoder only; skip generator/vae graphs)
         self._compile_safe_models_for_h100()
-        
+
         # Set up pre-allocated timestep tensors
-        self._setup_timestep_tensors()
+        self._pre_allocate_timestep_tensors(
+            batch_size=1,
+            max_frames=self.block_size,
+            device=self.device
+        )
         
     def _compile_safe_models_for_h100(self):
-        """Align with Interactive: compile text encoder call only; keep generator/vae eager."""
+        """Compile only text encoder call; keep generator eager; set VAE decode handle like interactive."""
         print("[RealTimeV2] Preparing text encoder compiled forward (reduce-overhead)...")
         try:
             self.pipeline.text_encoder._compiled_forward = torch.compile(
@@ -235,24 +229,34 @@ class RealTimeStreamingPipelineV2:
         print("[RealTimeV2] Skipping VAE compilation; using eager decode_to_pixel")
         self.pipeline.vae._compiled_decode = self.pipeline.vae.decode_to_pixel
             
-    def _setup_timestep_tensors(self):
-        """Pre-allocate timestep tensors for performance (from InteractiveCausalInferencePipeline)"""
+    def _pre_allocate_timestep_tensors(self, batch_size: int, max_frames: int, device: torch.device):
+        """Pre-allocate timestep tensors (mirror InteractiveCausalInferencePipeline)."""
         self._timestep_tensors = {}
-        self._noise_timestep_tensors = {}
-        self._context_timestep_base = torch.zeros([1, self.block_size], device=self.device, dtype=torch.long)
-        
-        # Pre-allocate for common timestep values
+        self._context_timestep_tensors = {}
         for timestep_val in self.pipeline.denoising_step_list:
             timestep_key = int(timestep_val.item()) if hasattr(timestep_val, 'item') else int(timestep_val)
             self._timestep_tensors[timestep_key] = torch.full(
-                [1, self.block_size], timestep_val, device=self.device, dtype=torch.long
+                (batch_size, max_frames),
+                timestep_key,
+                device=device,
+                dtype=torch.int64
             )
-            
-        # Pre-allocate noise timestep tensors for scheduling
+        context_val = getattr(self.config, 'context_noise', 0)
+        self._context_timestep_base = torch.full(
+            (batch_size, max_frames),
+            context_val,
+            device=device,
+            dtype=torch.int64
+        )
+        self._recache_timestep_cache = {}
+        self._noise_timestep_tensors = {}
         for timestep_val in self.pipeline.denoising_step_list:
             timestep_key = int(timestep_val.item()) if hasattr(timestep_val, 'item') else int(timestep_val)
             self._noise_timestep_tensors[timestep_key] = torch.full(
-                [self.block_size], timestep_val, device=self.device, dtype=self.pipeline.denoising_step_list.dtype
+                (batch_size * max_frames,),
+                timestep_key,
+                device=device,
+                dtype=torch.long
             )
     
     def _initialize_generation_caches(self):
@@ -290,38 +294,6 @@ class RealTimeStreamingPipelineV2:
         # Set attention size on all modules
         self.pipeline._set_all_modules_max_attention_size(local_attn_cfg)
         
-    def _old_setup_pipeline(self):
-        """Setup pipeline - copy initialization from InteractiveCausalInferencePipeline"""
-        # Load weights if specified
-        if getattr(self.config, 'generator_ckpt', None):
-            self._load_generator_weights()
-        
-        # Configure dtype and device
-        self.pipeline = self.pipeline.to(dtype=torch.bfloat16)
-        self.pipeline.generator.to(device=self.device)
-        self.pipeline.vae.to(device=self.device)
-        
-        # Setup LoRA if configured
-        self._setup_lora()
-        
-        # Initialize caches (copy from interactive pipeline logic)
-        self._initialize_caches()
-        
-        print("[RealTimeV2] Pipeline setup complete")
-        
-    def _load_generator_weights(self):
-        """Load generator weights"""
-        state_dict = torch.load(self.config.generator_ckpt, map_location="cpu")
-        raw_gen_state_dict = state_dict["generator_ema" if self.config.use_ema else "generator"]
-
-        if self.config.use_ema:
-            def _clean_key(name: str) -> str:
-                return name.replace("_fsdp_wrapped_module.", "")
-            cleaned_state_dict = {_clean_key(k): v for k, v in raw_gen_state_dict.items()}
-            self.pipeline.generator.load_state_dict(cleaned_state_dict, strict=False)
-        else:
-            self.pipeline.generator.load_state_dict(raw_gen_state_dict)
-            
     def _setup_lora(self):
         """Setup LoRA if configured"""
         try:
@@ -348,43 +320,6 @@ class RealTimeStreamingPipelineV2:
         except Exception as e:
             print(f"[RealTimeV2] LoRA setup skipped due to error: {e}")
             
-    def _initialize_caches(self):
-        """Initialize caches following InteractiveCausalInferencePipeline pattern"""
-        # Cache configuration (copy from interactive pipeline)
-        local_attn_cfg = getattr(self.config.model_kwargs, "local_attn_size", -1)
-        if local_attn_cfg != -1:
-            # Local attention
-            kv_cache_size = local_attn_cfg * self.pipeline.frame_seq_length
-        else:
-            # Global attention
-            kv_cache_size = self.total_frames * self.pipeline.frame_seq_length
-
-        print(f"[RealTimeV2] Initializing caches with size: {kv_cache_size}")
-        
-        # Initialize KV and cross-attention caches
-        self.pipeline._initialize_kv_cache(
-            batch_size=1,
-            dtype=torch.bfloat16,
-            device=self.device,
-            kv_cache_size_override=kv_cache_size
-        )
-        self.pipeline._initialize_crossattn_cache(
-            batch_size=1,
-            dtype=torch.bfloat16,
-            device=self.device
-        )
-        
-        # Pre-allocate timestep tensors
-        self.pipeline._pre_allocate_timestep_tensors(
-            batch_size=1,
-            max_frames=self.block_size,
-            device=self.device
-        )
-        
-        # Set attention configuration
-        self.pipeline.generator.model.local_attn_size = self.pipeline.local_attn_size
-        self.pipeline._set_all_modules_max_attention_size(self.pipeline.local_attn_size)
-        
     def add_frame_callback(self, callback: Callable[[np.ndarray, int], None]):
         """Add callback to receive decoded frames"""
         self.frame_callbacks.append(callback)
@@ -460,18 +395,6 @@ class RealTimeStreamingPipelineV2:
     def _generation_loop(self, initial_prompt: str):
         """Main generation loop - closely follows InteractiveCausalInferencePipeline.inference"""
         try:
-            # Safety: enforce BF16 on generator before first use (covers any late dtype changes)
-            try:
-                self.pipeline.generator.to(dtype=torch.bfloat16, device=self.device)
-                for module in self.pipeline.generator.modules():
-                    for p in module.parameters(recurse=False):
-                        if p is not None and p.dtype == torch.float32:
-                            p.data = p.data.to(torch.bfloat16)
-                    for name, b in module.named_buffers(recurse=False):
-                        if b is not None and b.dtype == torch.float32:
-                            setattr(module, name, b.to(torch.bfloat16))
-            except Exception:
-                pass
             # Encode initial prompt (like interactive pipeline)
             print("[RealTimeV2] Encoding initial prompt...")
             with torch.no_grad():
@@ -486,6 +409,22 @@ class RealTimeStreamingPipelineV2:
             # Initialize frame-by-frame generation (like interactive pipeline temporal loop)
             current_start_frame = 0
             self.pipeline.generator.model.local_attn_size = self.pipeline.local_attn_size
+            
+            # Allocate output on GPU like interactive (unless using low_memory mode externally)
+            output = torch.zeros(
+                [1, self.total_frames, 16, 60, 104],
+                device=self.noise.device,
+                dtype=self.noise.dtype
+            )
+            
+            # Pre-allocate timestep tensors (mirror interactive)
+            self._pre_allocate_timestep_tensors(batch_size=1, max_frames=self.block_size, device=self.noise.device)
+            
+            # Ensure caches are initialized and attention size configured
+            if not hasattr(self.pipeline, 'kv_cache1') or self.pipeline.kv_cache1 is None:
+                self._initialize_generation_caches()
+            self.pipeline.generator.model.local_attn_size = self.pipeline.local_attn_size
+            self.pipeline._set_all_modules_max_attention_size(self.pipeline.local_attn_size)
             
             # Temporal denoising by blocks (copy from interactive pipeline)
             all_num_frames = [self.block_size] * (self.total_frames // self.block_size)
@@ -509,8 +448,8 @@ class RealTimeStreamingPipelineV2:
                         except Exception:
                             pass
                         current_conditional_dict = {"prompt_embeds": out["prompt_embeds"]}
-                    # Perform recaching (like interactive pipeline)
-                    self._recache_after_switch(self.output, current_start_frame, current_conditional_dict)
+                    # Perform recaching (mirror interactive behavior)
+                    self._recache_after_switch(output, current_start_frame, current_conditional_dict)
                 
                 # Generate current block (copy from interactive pipeline block generation)
                 block_output = self._generate_block(
@@ -518,29 +457,7 @@ class RealTimeStreamingPipelineV2:
                 )
                 
                 # Store output (like interactive pipeline)
-                self.output[:, current_start_frame:current_start_frame + current_num_frames] = block_output.to(self.output.device)
-                
-                # Decode latents synchronously and stream frames
-                try:
-                    with torch.no_grad():
-                        video_frames = self.pipeline.vae._compiled_decode(block_output, use_cache=False)
-                    video_np = video_frames.cpu().numpy()
-                    video_np = (video_np * 0.5 + 0.5).clip(0, 1)
-                    for t in range(video_np.shape[1]):
-                        frame = video_np[0, t].transpose(1, 2, 0)
-                        frame_uint8 = (frame * 255).astype(np.uint8)
-                        frame_idx = current_start_frame + t
-                        self.latest_frame = frame_uint8
-                        for callback in self.frame_callbacks:
-                            try:
-                                callback(frame_uint8, frame_idx)
-                            except Exception as e:
-                                print(f"[RealTimeV2] Callback error: {e}")
-                finally:
-                    try:
-                        del video_frames, video_np
-                    except Exception:
-                        pass
+                output[:, current_start_frame:current_start_frame + current_num_frames] = block_output.to(output.device)
                 
                 # Update frame counter
                 self.current_frame = current_start_frame + current_num_frames
@@ -556,6 +473,31 @@ class RealTimeStreamingPipelineV2:
             import traceback
             traceback.print_exc()
         finally:
+            # Perform a single VAE decode at the end (align with Interactive)
+            try:
+                with torch.no_grad():
+                    latent_input = output.to(self.device)
+                    video = self.pipeline.vae._compiled_decode(latent_input, use_cache=False)
+                    video = (video * 0.5 + 0.5).clamp(0, 1)
+                # Stream frames to callbacks after decode
+                try:
+                    video_np = video.cpu().numpy()
+                    for t in range(video_np.shape[1]):
+                        frame = video_np[0, t].transpose(1, 2, 0)
+                        frame_uint8 = (frame * 255).astype(np.uint8)
+                        self.latest_frame = frame_uint8
+                        for callback in self.frame_callbacks:
+                            try:
+                                callback(frame_uint8, t)
+                            except Exception as e:
+                                print(f"[RealTimeV2] Callback error: {e}")
+                finally:
+                    try:
+                        del video_np
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"[RealTimeV2] Final VAE decode failed (continuing): {e}")
             self.is_running = False
             print("[RealTimeV2] Generation loop finished")
             
@@ -707,57 +649,6 @@ class RealTimeStreamingPipelineV2:
             blk["v"].zero_()
             blk["is_init"] = False
             
-    def _vae_decode_loop(self):
-        """Asynchronous VAE decoding loop"""
-        print("[RealTimeV2] Starting VAE decode loop...")
-        
-        try:
-            while self.is_running or not self.latents_queue.empty():
-                try:
-                    # Get latents chunk from queue
-                    latents_chunk, start_frame = self.latents_queue.get(timeout=1.0)
-                    
-                    print(f"[RealTimeV2] Decoding latents for frames {start_frame}-{start_frame + latents_chunk.shape[1] - 1}")
-                    
-                    # Decode to video frames
-                    with torch.no_grad():
-                        video_frames = self.pipeline.vae.decode_to_pixel(latents_chunk, use_cache=False)
-                    
-                    # Convert to numpy and stream
-                    video_np = video_frames.cpu().numpy()  # [B, T, C, H, W]
-                    video_np = (video_np * 0.5 + 0.5).clip(0, 1)  # Normalize to [0,1]
-                    
-                    # Stream individual frames
-                    for t in range(video_np.shape[1]):
-                        frame = video_np[0, t].transpose(1, 2, 0)  # [H, W, C]
-                        frame_uint8 = (frame * 255).astype(np.uint8)
-                        frame_idx = start_frame + t
-                        
-                        # Store latest frame
-                        self.latest_frame = frame_uint8
-                        
-                        # Call all registered callbacks
-                        for callback in self.frame_callbacks:
-                            try:
-                                callback(frame_uint8, frame_idx)
-                            except Exception as e:
-                                print(f"[RealTimeV2] Callback error: {e}")
-                    
-                    # Memory cleanup after processing each batch
-                    del latents_chunk, video_frames, video_np
-                    if hasattr(torch.cuda, 'empty_cache'):
-                        torch.cuda.empty_cache()
-                                
-                except queue.Empty:
-                    continue
-                except Exception as e:
-                    print(f"[RealTimeV2] VAE decode error: {e}")
-                    
-        except Exception as e:
-            print(f"[RealTimeV2] VAE decode loop error: {e}")
-        finally:
-            print("[RealTimeV2] VAE decode loop finished")
-            
     def reset_for_new_video(self):
         """Reset for new video generation"""
         print("[RealTimeV2] Resetting for new video...")
@@ -794,7 +685,7 @@ class RealTimeStreamingPipelineV2:
         ], device=self.device, dtype=torch.bfloat16)
         
         # Create new output tensor
-        self.output = torch.zeros_like(self.noise)
+        self.output = None
         
         print("[RealTimeV2] Reset complete")
         
